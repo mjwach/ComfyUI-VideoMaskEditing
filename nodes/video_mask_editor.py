@@ -64,16 +64,14 @@ INPUTS (optional):
                           the keyframe PNGs' own width/height it lets the
                           editor notice a changed input and offer to
                           rescale the keyframes.
-  preview_max_size
-                 INT     longest side, in pixels, of the reference frames
-                          the editor shows (0 = full resolution). Display
-                          only; masks are always painted at full size.
 
 REFERENCE FRAMES:
   Each execute() remembers the input batch (a reference to the tensor, not
   a copy) under the node's session id. The editor fetches frames from
-  /vme/frames/* one at a time, downscaled and JPEG-encoded on demand, so no
-  Preview Image node is needed and big videos stay cheap to browse.
+  /vme/frames/* one at a time, downscaled (to the size picked in the
+  editor's Preview menu) and JPEG-encoded on demand, so no Preview Image
+  node is needed and big videos stay cheap to browse. Masks are always
+  painted at the input's full size.
 
 OUTPUTS:
   mask           MASK    (B,H,W) float32 in [0,1]
@@ -737,13 +735,6 @@ class VideoMaskEditorMEC:
                                "keyframes were made for (0 = unknown). "
                                "Written by the editor.",
                 }),
-                "preview_max_size": ("INT", {
-                    "default": 1024, "min": 0, "max": 16384, "step": 64,
-                    "tooltip": "Longest side (px) of the reference frames "
-                               "shown in the editor; 0 = full resolution. "
-                               "Smaller loads faster. Display only: masks "
-                               "are always painted at the input's full size.",
-                }),
             },
         }
 
@@ -755,7 +746,7 @@ class VideoMaskEditorMEC:
     def IS_CHANGED(cls, image, session_id, tween_mode, feather, threshold,
                    input_mask=None, keyframes_data="", brush_opacity=1.0,
                    brush_feather=0.0, brush_size=30, keyframe_frame_count=0,
-                   preview_max_size=1024, **kwargs):
+                   **kwargs):
         return hash_args_and_kwargs(
             image, session_id, tween_mode, feather, threshold, input_mask,
             keyframes_data, keyframe_frame_count, **kwargs,
@@ -774,7 +765,6 @@ class VideoMaskEditorMEC:
         brush_feather: float = 0.0,
         brush_size: int = 30,
         keyframe_frame_count: int = 0,
-        preview_max_size: int = 1024,
     ):
         if image is None or not isinstance(image, torch.Tensor) or image.ndim != 4:
             raise ValueError("VideoMaskEditorMEC: image must be IMAGE tensor [B,H,W,C]")

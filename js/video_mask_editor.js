@@ -1,86 +1,65 @@
+// Derived from js/video_mask_editor.js in ComfyUI-CustomNodePacks
+// by Code2Collapse (Likhith) -- https://github.com/Code2Collapse
+// (https://github.com/Code2Collapse/ComfyUI-CustomNodePacks), Apache-2.0.
+// Modified (see CHANGES.md): keyframes persisted in the workflow; brush
+// settings remembered; frames are loaded from the node itself (downscaled,
+// on demand) instead of from an upstream preview; a dialog offers to rescale
+// or delete keyframes when the input's size or frame count changed; the
+// original pack's shared theme/dialog/report helpers were replaced by small
+// local equivalents; server routes moved to /vme/*.
 /**
  * VideoMaskEditorMEC — fullscreen video mask editor.
  *
  * Tools: brush · erase · fill · lasso · onion-skin · history.
  * Storage: per-pinned-frame ImageData kept client-side, POSTed to the
- *   server-side session on Save (PNG-compressed per frame).
- * UX target: high-contrast dark UI, GPU-light (one canvas per frame
- *   on demand; off-screen mask buffer only for the current frame).
+ *   server-side session on Save (PNG-compressed per frame), and also
+ *   written into the node's keyframes_data widget so it saves with the
+ *   workflow.
+ * Frames: fetched from the node's own /vme/frames routes (downscaled JPEGs,
+ *   loaded on demand + prefetched around the current frame).
  */
 
 import { app } from "../../scripts/app.js";
-import { findUpstreamFramesAsync } from "./_frame_finder.js";
-import { reportFailure as __c2cReport } from "./_c2c_report.js";
-import { c2cAlert } from "./_c2c_dialog.js";
-// NOTE: do NOT import { C } from './_c2c_theme.js' here.
-// This module defines its OWN local `C` Proxy below (line ~46) that reads
-// live CSS custom properties so Canvas2D fillStyle / strokeStyle stays in
-// sync with the active C2C variant at paint time. A duplicate `import { C }`
-// produced `SyntaxError: Identifier 'C' has already been declared` and made
-// the browser silently drop this entire ESM extension (mask editor never
-// registered). Verified via `node --input-type=module` reparse 2026-05-28.
 
 const NODE_NAME = "VideoMaskEditorMEC";
 
-// ─── Theme palette ─────────────────────────────────────────────────
-// Reads live CSS custom properties so Canvas2D + cssText interpolations
-// stay in sync with the active C2C theme. Hex fallbacks keep the editor
-// usable if tokens are unset (e.g. theme module hasn't booted yet).
-//
-// IMPORTANT: Canvas2D fillStyle/strokeStyle does NOT understand `var(...)`
-// CSS functions — assigning a `var(...)` string is silently ignored and
-// the previous color (default #000000) is kept. So every fallback below
-// MUST be a literal color, NOT a `var(...)` reference. Same applies to
-// keys that don't have a `_C_TOKEN` entry: the proxy returns the literal
-// fallback directly. (Verified 2026-05-28: missing `white`/`bg3`/`surface1`
-// keys made the lasso-fill paint black instead of white, breaking the
-// inside/outside polygon mask.)
-const _C_FALLBACK = {
+// ─── Palette ───────────────────────────────────────────────────────
+// Fixed colours (Catppuccin Mocha, as the original pack's default theme).
+// Canvas2D fillStyle/strokeStyle needs literal colours, and _hexToRgb()
+// expects "#rrggbb", so keep these as plain 6-digit hex.
+const C = {
     bg:       "#1e1e2e",
+    bg2:      "#181825",
     bg3:      "#181825",   // scrubber track + "loading…" background
+    bg4:      "#11111b",
     panel:    "#313244",
     surface0: "#313244",
     surface1: "#45475a",   // frame tick marks
-    border:   "#45475a",
+    border:   "#585b70",
     text:     "#cdd6f4",
-    sub:      "#9399b2",
+    sub:      "#a6adc8",
     accent:   "#a6e3a1",
     accent2:  "#89b4fa",
-    warn:     "#fab387",
+    warn:     "#f9e2af",
     danger:   "#f38ba8",
     onion:    "#f9e2af",
     white:    "#ffffff",   // lasso-fill stencil — MUST be opaque white
+    okBg:     "#3a5f50",
+    okBg2:    "#2d4a3e",
+    okMid2:   "#7fd17a",
+    dangerBg2:"#4a2d2d",
+    dangerBg3:"#5f3a3a",
+    hover:    "#2a2a3e",
+    rowHover: "#222234",
+    violetBg: "#332233",
+    scrim5:   "#101018",
+    scrim6:   "#0f0f17",
 };
-const _C_TOKEN = {
-    bg:       "--c2c-bg",
-    panel:    "--c2c-surface0",
-    surface0: "--c2c-surface0",
-    border:   "--c2c-surface2",
-    text:     "--c2c-fg",
-    sub:      "--c2c-sub",
-    accent:   "--c2c-green",
-    accent2:  "--c2c-blue",
-    warn:     "--c2c-yellow",
-    danger:   "--c2c-red",
-    onion:    "--c2c-yellow",
-    // NOTE: `bg3`, `surface1`, `white` deliberately have no CSS token —
-    // they fall through to the literal hex in _C_FALLBACK above so the
-    // canvas always gets a parseable color.
-};
-const C = new Proxy(_C_FALLBACK, {
-    get(target, key) {
-        const tok = _C_TOKEN[key];
-        if (tok) {
-            try {
-                const v = getComputedStyle(document.documentElement).getPropertyValue(tok).trim();
-                if (v) return v;
-            } catch (err) {
-                __c2cReport?.("video_mask_editor.palette", err, { token: tok, severity: "info" });
-            }
-        }
-        return target[key];
-    },
-});
+const Z_MODAL = 10000;
+
+function __c2cReport(where, err) {
+    console.warn(`[VideoMaskEditor] ${where}:`, err);
+}
 
 const HISTORY_LIMIT = 60;
 
@@ -91,9 +70,69 @@ function uuid() {
         (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & 15) >> (c / 4)).toString(16));
 }
 
-// ─── Upstream frame discovery (shared finder) ──────────────────────
-// Implementation lives in _frame_finder.js and handles video sources,
-// sibling preview scan, and single-frame fallback.
+// ─── Small modal dialogs ───────────────────────────────────────────
+// ComfyUI blocks window.alert(), so dialogs are plain DOM. While one is
+// open it swallows keyboard events so the editor's shortcuts don't fire.
+function _modalShell(widthPx = 420) {
+    const backdrop = document.createElement("div");
+    backdrop.style.cssText = `
+        position:fixed;inset:0;z-index:${Z_MODAL + 10};display:flex;
+        align-items:center;justify-content:center;background:rgba(0,0,0,0.55);
+        font-family:Inter,system-ui,sans-serif;`;
+    const card = document.createElement("div");
+    card.style.cssText = `
+        width:min(${widthPx}px,92vw);background:${C.bg2};color:${C.text};
+        border:1px solid ${C.border};border-radius:10px;padding:18px 20px 16px;
+        box-shadow:0 16px 56px rgba(0,0,0,0.6);box-sizing:border-box;font-size:13px;`;
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    return { backdrop, card };
+}
+
+function _dlgButton(label, { primary = false, danger = false } = {}) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.style.cssText = `
+        padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px;
+        font-weight:${primary ? 600 : 500};
+        background:${primary ? C.accent : C.panel};
+        color:${primary ? C.bg4 : (danger ? C.danger : C.text)};
+        border:1px solid ${primary ? C.accent : (danger ? C.danger + "88" : C.border)};`;
+    return b;
+}
+
+function vmeAlert(message, title = "Video Mask Editor") {
+    return new Promise((resolve) => {
+        const { backdrop, card } = _modalShell(440);
+        const h = document.createElement("div");
+        h.textContent = title;
+        h.style.cssText = `font-weight:600;color:${C.accent};margin-bottom:10px;`;
+        const m = document.createElement("div");
+        m.textContent = message;
+        m.style.cssText = "white-space:pre-wrap;line-height:1.5;margin-bottom:16px;";
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;justify-content:flex-end;";
+        const ok = _dlgButton("OK", { primary: true });
+        row.appendChild(ok);
+        card.append(h, m, row);
+        const onKey = (e) => {
+            e.stopImmediatePropagation();
+            if (e.type === "keydown" && (e.key === "Enter" || e.key === "Escape")) {
+                e.preventDefault(); done();
+            }
+        };
+        const done = () => {
+            document.removeEventListener("keydown", onKey, true);
+            document.removeEventListener("keyup", onKey, true);
+            backdrop.remove();
+            resolve();
+        };
+        ok.onclick = done;
+        document.addEventListener("keydown", onKey, true);
+        document.addEventListener("keyup", onKey, true);
+        requestAnimationFrame(() => ok.focus());
+    });
+}
 
 function blobToBase64(blob) {
     return new Promise((resolve, reject) => {
@@ -104,36 +143,387 @@ function blobToBase64(blob) {
     });
 }
 
-function loadImage(url) {
-    return new Promise((resolve, reject) => {
-        const cached = loadImage.cache?.get(url);
-        if (cached?.complete) return resolve(cached);
-        const img = new Image();
-        img.crossOrigin = "anonymous";
-        img.onload = () => {
-            if (!loadImage.cache) loadImage.cache = new Map();
-            loadImage.cache.set(url, img);
-            resolve(img);
-        };
-        img.onerror = reject;
-        img.src = url;
-    });
+// ─── Reference frames (served by the node itself) ──────────────────
+// The node keeps the input batch from its last run; frames are fetched one
+// at a time as downscaled JPEGs. Compressed frames are kept in memory (up
+// to BLOB_CACHE_BYTES) and prefetched outward from the current frame; only
+// a small window of them is decoded at any moment.
+const BITMAP_CACHE = 40;                        // decoded frames kept
+const BLOB_CACHE_BYTES = 512 * 1024 * 1024;     // compressed frames kept
+const PREFETCH_WORKERS = 4;
+const PREVIEW_DEFAULT = 1024;                   // px, longest side
+const PREVIEW_CHOICES = [[512, "512 px"], [768, "768 px"], [1024, "1024 px"],
+                         [1536, "1536 px"], [2048, "2048 px"], [0, "full size"]];
+
+class FrameSource {
+    constructor(sessionId, maxSide) {
+        this.sessionId = sessionId;
+        this.maxSide = Math.max(0, maxSide | 0);
+        this.count = 0;
+        this.width = 0;
+        this.height = 0;
+        this.token = "";
+        this.blobs = new Map();      // i -> Blob (JPEG)
+        this.blobBytes = 0;
+        this.bitmaps = new Map();    // i -> ImageBitmap, oldest first
+        this.inflight = new Map();   // i -> Promise<Blob>
+        this.decoding = new Map();   // i -> Promise<ImageBitmap>
+        this.focus = 0;
+        this.protect = -1;           // frame index currently on screen
+        this.workers = 0;
+        this.disposed = false;
+        this.stale = false;          // node re-ran on another input meanwhile
+        this.onFrameReady = null;    // (i) => void
+    }
+
+    /** Ask the node what it last ran on. False if it hasn't run yet. */
+    async init() {
+        const r = await fetch(`/vme/frames/info?session=${encodeURIComponent(this.sessionId)}`);
+        if (!r.ok) return false;
+        const j = await r.json();
+        this.count = j.frames | 0;
+        this.width = j.width | 0;
+        this.height = j.height | 0;
+        this.token = String(j.token || "");
+        return this.count > 0 && this.width > 0 && this.height > 0;
+    }
+
+    _url(i) {
+        return `/vme/frames/frame?session=${encodeURIComponent(this.sessionId)}` +
+               `&token=${encodeURIComponent(this.token)}&i=${i}&max=${this.maxSide}`;
+    }
+
+    _fetchBlob(i) {
+        const have = this.blobs.get(i);
+        if (have) return Promise.resolve(have);
+        let p = this.inflight.get(i);
+        if (p) return p;
+        p = fetch(this._url(i)).then(async (r) => {
+            if (r.status === 409) { this.stale = true; throw new Error("input changed"); }
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const b = await r.blob();
+            if (!this.disposed && !this.blobs.has(i)) {
+                this.blobs.set(i, b);
+                this.blobBytes += b.size;
+                this._trimBlobs();
+            }
+            return b;
+        }).finally(() => this.inflight.delete(i));
+        this.inflight.set(i, p);
+        return p;
+    }
+
+    _trimBlobs() {
+        while (this.blobBytes > BLOB_CACHE_BYTES && this.blobs.size > 1) {
+            let far = -1, farD = -1;
+            for (const k of this.blobs.keys()) {
+                const d = Math.abs(k - this.focus);
+                if (d > farD) { farD = d; far = k; }
+            }
+            this.blobBytes -= this.blobs.get(far).size;
+            this.blobs.delete(far);
+        }
+    }
+
+    /** Decoded frame if ready (no loading), else null. */
+    peek(i) {
+        const bm = this.bitmaps.get(i);
+        if (!bm) return null;
+        this.bitmaps.delete(i);      // mark as recently used
+        this.bitmaps.set(i, bm);
+        return bm;
+    }
+
+    /** Load + decode frame i. */
+    request(i) {
+        if (i < 0 || i >= this.count) return Promise.resolve(null);
+        if (this.bitmaps.has(i)) return Promise.resolve(this.peek(i));
+        let p = this.decoding.get(i);
+        if (p) return p;
+        p = this._fetchBlob(i)
+            .then((b) => createImageBitmap(b))
+            .then((bm) => {
+                if (this.disposed) { bm.close?.(); return null; }
+                this.bitmaps.set(i, bm);
+                this._trimBitmaps();
+                this.onFrameReady?.(i);
+                return bm;
+            })
+            .finally(() => this.decoding.delete(i));
+        this.decoding.set(i, p);
+        return p;
+    }
+
+    _trimBitmaps() {
+        if (this.bitmaps.size <= BITMAP_CACHE) return;
+        for (const k of [...this.bitmaps.keys()]) {
+            if (this.bitmaps.size <= BITMAP_CACHE) break;
+            if (k === this.protect || k === this.focus) continue;
+            this.bitmaps.get(k).close?.();
+            this.bitmaps.delete(k);
+        }
+    }
+
+    /** The user is looking at frame i: load it first, then its neighbours. */
+    setFocus(i) {
+        this.focus = i;
+        this.request(i).catch(() => {});
+        for (const d of [1, -1, 2]) this.request(i + d).catch(() => {});
+        this._pump();
+    }
+
+    _nextToPrefetch() {
+        for (let d = 0; d < this.count; d++) {
+            for (const i of d ? [this.focus + d, this.focus - d] : [this.focus]) {
+                if (i >= 0 && i < this.count && !this.blobs.has(i) && !this.inflight.has(i)) return i;
+            }
+        }
+        return -1;
+    }
+
+    _pump() {
+        while (!this.disposed && !this.stale && this.workers < PREFETCH_WORKERS &&
+               this.blobBytes < BLOB_CACHE_BYTES * 0.9) {
+            const i = this._nextToPrefetch();
+            if (i < 0) return;
+            this.workers++;
+            this._fetchBlob(i).catch(() => {}).finally(() => {
+                this.workers--;
+                this._pump();
+            });
+        }
+    }
+
+    loadedCount() { return this.blobs.size; }
+
+    dispose() {
+        this.disposed = true;
+        for (const bm of this.bitmaps.values()) bm.close?.();
+        this.bitmaps.clear();
+        this.blobs.clear();
+        this.blobBytes = 0;
+    }
 }
 
+
+// ─── Keyframe rescaling ─────────────────────────────────────────────
+/** Resample one keyframe (RGBA ImageData; the mask lives in alpha) to
+ *  dw×dh. method: "nearest" (keeps hard edges) or "bilinear". */
+function resampleKeyframe(id, dw, dh, method, rgb) {
+    const sw = id.width, sh = id.height, src = id.data;
+    const out = new ImageData(dw, dh);
+    const dst = out.data;
+    if (method === "nearest") {
+        const xs = new Int32Array(dw);
+        for (let x = 0; x < dw; x++) xs[x] = Math.min(sw - 1, Math.floor((x + 0.5) * sw / dw));
+        for (let y = 0; y < dh; y++) {
+            const sy = Math.min(sh - 1, Math.floor((y + 0.5) * sh / dh));
+            const srow = sy * sw, drow = y * dw;
+            for (let x = 0; x < dw; x++) {
+                const o = (drow + x) * 4;
+                dst[o] = rgb.r; dst[o + 1] = rgb.g; dst[o + 2] = rgb.b;
+                dst[o + 3] = src[(srow + xs[x]) * 4 + 3];
+            }
+        }
+        return out;
+    }
+    // bilinear, pixel-centre aligned
+    const x0s = new Int32Array(dw), x1s = new Int32Array(dw), wxs = new Float32Array(dw);
+    for (let x = 0; x < dw; x++) {
+        const fx = (x + 0.5) * sw / dw - 0.5;
+        let x0 = Math.floor(fx), wx = fx - x0;
+        if (x0 < 0) { x0 = 0; wx = 0; }
+        let x1 = x0 + 1;
+        if (x1 > sw - 1) { x1 = sw - 1; }
+        x0s[x] = Math.min(x0, sw - 1); x1s[x] = x1; wxs[x] = wx;
+    }
+    for (let y = 0; y < dh; y++) {
+        const fy = (y + 0.5) * sh / dh - 0.5;
+        let y0 = Math.floor(fy), wy = fy - y0;
+        if (y0 < 0) { y0 = 0; wy = 0; }
+        y0 = Math.min(y0, sh - 1);
+        const y1 = Math.min(y0 + 1, sh - 1);
+        const r0 = y0 * sw, r1 = y1 * sw, drow = y * dw;
+        for (let x = 0; x < dw; x++) {
+            const wx = wxs[x];
+            const a00 = src[(r0 + x0s[x]) * 4 + 3], a01 = src[(r0 + x1s[x]) * 4 + 3];
+            const a10 = src[(r1 + x0s[x]) * 4 + 3], a11 = src[(r1 + x1s[x]) * 4 + 3];
+            const top = a00 + (a01 - a00) * wx;
+            const bot = a10 + (a11 - a10) * wx;
+            const o = (drow + x) * 4;
+            dst[o] = rgb.r; dst[o + 1] = rgb.g; dst[o + 2] = rgb.b;
+            dst[o + 3] = Math.round(top + (bot - top) * wy);
+        }
+    }
+    return out;
+}
+
+/** New index for keyframe f when the clip goes from oldN to newN frames. */
+function remapFrameIndex(f, oldN, newN) {
+    if (oldN === newN) return Math.max(0, Math.min(newN - 1, f));
+    return Math.max(0, Math.min(newN - 1, Math.round(f * newN / oldN)));
+}
+
+/**
+ * Shown when saved keyframes don't match the current input. Resolves to
+ *   { action: "cancel" } | { action: "delete" } |
+ *   { action: "rescale", oldCount, method }
+ */
+function showMismatchDialog(info) {
+    // info: { inW, inH, inN, kfSizes: [[w,h],…], kfN (number|null), nKeyframes }
+    return new Promise((resolve) => {
+        const { backdrop, card } = _modalShell(520);
+        const kfW = info.kfSizes.length === 1 ? info.kfSizes[0][0] : null;
+        const kfH = info.kfSizes.length === 1 ? info.kfSizes[0][1] : null;
+        const mixed = info.kfSizes.length > 1;
+        const sizeDiffers = mixed || kfW !== info.inW || kfH !== info.inH;
+
+        const h = document.createElement("div");
+        h.textContent = "Keyframes don't match this input";
+        h.style.cssText = `font-weight:600;font-size:14px;color:${C.warn};margin-bottom:8px;`;
+        const intro = document.createElement("div");
+        intro.style.cssText = `color:${C.sub};line-height:1.5;margin-bottom:14px;`;
+        intro.textContent =
+            `This node has ${info.nKeyframes} saved keyframe${info.nKeyframes === 1 ? "" : "s"}, ` +
+            "made for a video of a different size or length than the one now connected " +
+            "(or of an unknown length). Choose what to do with them.";
+
+        // Comparison table.
+        const tbl = document.createElement("table");
+        tbl.style.cssText = `border-collapse:collapse;width:100%;margin-bottom:14px;font-size:12px;`;
+        const cell = (txt, { head = false, bad = false } = {}) => {
+            const td = document.createElement(head ? "th" : "td");
+            td.style.cssText = `padding:6px 8px;border-bottom:1px solid ${C.border};text-align:${head ? "left" : "right"};` +
+                `font-weight:${head ? 600 : 400};color:${bad ? C.warn : (head ? C.sub : C.text)};` +
+                `font-family:${head ? "inherit" : "ui-monospace,monospace"};`;
+            if (txt instanceof Node) td.appendChild(txt); else td.textContent = txt;
+            return td;
+        };
+        const hdr = document.createElement("tr");
+        hdr.append(cell("", { head: true }), cell("Keyframes made for", { head: true }), cell("Current input", { head: true }));
+        tbl.appendChild(hdr);
+        const wTxt = mixed ? "mixed" : String(kfW);
+        const hTxt = mixed ? "mixed" : String(kfH);
+        const rowW = document.createElement("tr");
+        rowW.append(cell("Width", { head: true }), cell(wTxt, { bad: mixed || kfW !== info.inW }), cell(String(info.inW)));
+        const rowH = document.createElement("tr");
+        rowH.append(cell("Height", { head: true }), cell(hTxt, { bad: mixed || kfH !== info.inH }), cell(String(info.inH)));
+        const rowN = document.createElement("tr");
+        let countInput = null;
+        if (info.kfN == null) {
+            const wrap = document.createElement("div");
+            wrap.style.cssText = "display:flex;flex-direction:column;align-items:flex-end;gap:4px;";
+            const lab = document.createElement("div");
+            lab.textContent = "unknown — enter it:";
+            lab.style.cssText = `color:${C.warn};font-family:inherit;font-size:11px;`;
+            countInput = document.createElement("input");
+            countInput.type = "number"; countInput.min = "1"; countInput.step = "1";
+            countInput.placeholder = "frames";
+            countInput.style.cssText = `width:90px;padding:4px 6px;border-radius:5px;text-align:right;
+                background:${C.bg};color:${C.text};border:1px solid ${C.border};font:inherit;`;
+            const same = document.createElement("a");
+            same.textContent = `same as now (${info.inN})`;
+            same.href = "#";
+            same.style.cssText = `color:${C.accent2};font-size:11px;font-family:inherit;`;
+            same.onclick = (e) => { e.preventDefault(); countInput.value = String(info.inN); update(); };
+            wrap.append(lab, countInput, same);
+            rowN.append(cell("Frames", { head: true }), cell(wrap, { bad: true }), cell(String(info.inN)));
+        } else {
+            rowN.append(cell("Frames", { head: true }), cell(String(info.kfN), { bad: info.kfN !== info.inN }), cell(String(info.inN)));
+        }
+        tbl.append(rowW, rowH, rowN);
+
+        // Resampling choice (only meaningful when width/height change).
+        const methodRow = document.createElement("div");
+        methodRow.style.cssText = "display:flex;align-items:center;gap:10px;margin-bottom:8px;";
+        const mLab = document.createElement("span");
+        mLab.textContent = "Resampling:";
+        mLab.style.color = C.sub;
+        const sel = document.createElement("select");
+        sel.style.cssText = `padding:4px 6px;border-radius:5px;background:${C.bg};color:${C.text};border:1px solid ${C.border};font:inherit;`;
+        for (const [v, t] of [["nearest", "Nearest neighbor (keeps masks hard-edged)"],
+                              ["bilinear", "Bilinear (smooth edges)"]]) {
+            const o = document.createElement("option"); o.value = v; o.textContent = t; sel.appendChild(o);
+        }
+        methodRow.append(mLab, sel);
+        if (!sizeDiffers) methodRow.style.display = "none";
+
+        const explain = document.createElement("div");
+        explain.style.cssText = `color:${C.sub};font-size:11px;line-height:1.5;margin-bottom:16px;min-height:16px;`;
+
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;";
+        const bCancel = _dlgButton("Cancel");
+        bCancel.title = "Close the editor without changing anything";
+        const bDelete = _dlgButton("Delete all keyframes", { danger: true });
+        const bRescale = _dlgButton("Rescale keyframes", { primary: true });
+        row.append(bCancel, bDelete, bRescale);
+
+        card.append(h, intro, tbl, methodRow, explain, row);
+
+        const oldCount = () => {
+            if (!countInput) return info.kfN;
+            const v = Number(countInput.value);
+            return Number.isInteger(v) && v >= 1 ? v : null;
+        };
+        const update = () => {
+            const n = oldCount();
+            bRescale.disabled = n == null;
+            bRescale.style.opacity = n == null ? "0.5" : "1";
+            bRescale.style.cursor = n == null ? "not-allowed" : "pointer";
+            const parts = [];
+            if (sizeDiffers) parts.push(`Masks will be resized to ${info.inW}×${info.inH}.`);
+            if (n != null && n !== info.inN) {
+                parts.push(`Keyframe positions will be scaled by ${info.inN}/${n} and rounded to the nearest frame.`);
+            }
+            if (!parts.length && n != null) parts.push("Nothing to resize; this just records the frame count.");
+            parts.push("Takes effect when you click Save & Close.");
+            explain.textContent = parts.join(" ");
+        };
+        if (countInput) countInput.addEventListener("input", update);
+        update();
+
+        const onKey = (e) => {
+            // Keep the editor's own shortcuts from firing behind the dialog.
+            e.stopImmediatePropagation();
+            if (e.type === "keydown" && e.key === "Escape") { e.preventDefault(); finish({ action: "cancel" }); }
+        };
+        const finish = (res) => {
+            document.removeEventListener("keydown", onKey, true);
+            document.removeEventListener("keyup", onKey, true);
+            backdrop.remove();
+            resolve(res);
+        };
+        bCancel.onclick = () => finish({ action: "cancel" });
+        bDelete.onclick = () => finish({ action: "delete" });
+        bRescale.onclick = () => {
+            const n = oldCount();
+            if (n == null) { countInput?.focus(); return; }
+            finish({ action: "rescale", oldCount: n, method: sel.value });
+        };
+        document.addEventListener("keydown", onKey, true);
+        document.addEventListener("keyup", onKey, true);
+        requestAnimationFrame(() => (countInput || bRescale).focus());
+    });
+}
 
 // ─── Editor session class ───────────────────────────────────────────
 class VMEEditor {
     constructor(node) {
         this.node = node;
         this.sessionId = this._getOrCreateSession();
-        this.frameUrls = [];
-        this.frameImgs = [];       // loaded HTMLImageElements
+        this.frames = null;        // FrameSource, set by loadFrames()
+        this._shownIdx = -1;       // frame whose picture is on screen
         this.frameCount = 0;
         this.frameW = 0;
         this.frameH = 0;
         this.curFrame = 0;
         // Pinned keyframes: Map<frame:int, ImageData>
         this.keyframes = new Map();
+        // Frame count of the input the keyframes were made for (null =
+        // unknown). Width/height come from the keyframes themselves.
+        const kfn = this._widget("keyframe_frame_count")?.value;
+        this.kfFrameCount = (typeof kfn === "number" && kfn > 0) ? kfn : null;
         this.curMask = null;       // ImageData for current frame's working buffer
         this.curDirty = false;
         // Tool state
@@ -204,46 +594,153 @@ class VMEEditor {
     }
 
     // ── frame init / switch ──────────────────────────────────────────
+    /** Longest side of the reference pictures (0 = full size). Kept in the
+     *  node's properties: saved with the workflow but never sent to the
+     *  backend, so changing it doesn't make anything re-run. */
+    _previewMaxSide() {
+        const v = this.node.properties?.vme_preview_max_size;
+        return (typeof v === "number" && v >= 0) ? v : PREVIEW_DEFAULT;
+    }
+
+    async setPreviewMaxSide(v) {
+        if (!this.node.properties) this.node.properties = {};
+        this.node.properties.vme_preview_max_size = v;
+        if (!this.frames || !this.frameCount) return;
+        const old = this.frames;
+        const fresh = new FrameSource(this.sessionId, v);
+        Object.assign(fresh, { count: old.count, width: old.width, height: old.height, token: old.token });
+        fresh.onFrameReady = old.onFrameReady;
+        old.dispose();
+        this.frames = fresh;
+        this._shownIdx = -1;
+        fresh.setFocus(this.curFrame);
+        this.draw();
+    }
+
     async loadFrames() {
-        const urls = await findUpstreamFramesAsync(this.node, { maxVideoFrames: 32 });
-        if (!urls.length) {
-            c2cAlert("[VideoMaskEditor]\n\nNo frames found upstream. " +
-                  "Queue Prompt once so the upstream image source has " +
-                  "previewable frames, then re-open the editor.");
+        this.frames = new FrameSource(this.sessionId, this._previewMaxSide());
+        let ok = false;
+        try { ok = await this.frames.init(); }
+        catch (e) { __c2cReport("frames.init", e); }
+        if (!ok) {
+            await vmeAlert(
+                "The editor has no frames to show yet.\n\n" +
+                "Run the workflow once — or select just this node and run it " +
+                "(it's an output node, so it can be run on its own) — so it can " +
+                "pick up the input video. Then open the editor again.");
             return false;
         }
-        this.frameUrls = urls;
-        this.frameCount = urls.length;
-        this.frameImgs = new Array(urls.length).fill(null);
-        // Load first frame to learn dimensions.
-        const im0 = await loadImage(urls[0]);
-        this.frameW = im0.naturalWidth;
-        this.frameH = im0.naturalHeight;
-        this.frameImgs[0] = im0;
-        // Lazy-load others in background.
-        urls.slice(1).forEach((u, i) => {
-            loadImage(u).then(img => { this.frameImgs[i + 1] = img; this.draw(); })
-                        .catch(() => {});
-        });
-        // Init session on server.
-        try {
-            await fetch(`/mec/video_mask_editor/init?session=${encodeURIComponent(this.sessionId)}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ h: this.frameH, w: this.frameW }),
-            });
-        } catch (e) { console.warn("[VME] init failed:", e); }
-        // Fetch existing server-side keyframes (in case we re-opened a session).
-        try {
-            const r = await fetch(`/mec/video_mask_editor/state?session=${encodeURIComponent(this.sessionId)}`);
-            const j = await r.json();
-            for (const f of j.keyframes || []) await this._fetchExistingKeyframe(f);
-        } catch (e) { __c2cReport("video_mask_editor", e); }
+        this.frameCount = this.frames.count;
+        this.frameW = this.frames.width;
+        this.frameH = this.frames.height;
+        this.frames.onFrameReady = (i) => {
+            if (i === this.curFrame || this._shownIdx < 0) this.draw();
+        };
+
+        // Keyframes: the workflow copy is authoritative; the in-memory
+        // server session is only a fallback for older workflows.
+        await this._restoreFromWidget();
         if (this.keyframes.size === 0) {
-            await this._restoreFromWidget();
+            try {
+                const r = await fetch(`/vme/state?session=${encodeURIComponent(this.sessionId)}`);
+                const j = await r.json();
+                for (const f of j.keyframes || []) await this._fetchExistingKeyframe(f);
+            } catch (e) { __c2cReport("video_mask_editor", e); }
         }
+        if (this.keyframes.size === 0) this.kfFrameCount = null;
+
+        if (!(await this._resolveMismatch())) return false;
+
         this._switchFrame(0, { fresh: true });
         return true;
+    }
+
+    /** Distinct [w,h] sizes among the keyframes. */
+    _keyframeSizes() {
+        const seen = new Map();
+        for (const id of this.keyframes.values()) seen.set(`${id.width}x${id.height}`, [id.width, id.height]);
+        return [...seen.values()];
+    }
+
+    /** If the keyframes were made for a different input, make the user
+     *  choose: cancel (returns false), delete them, or rescale them. */
+    async _resolveMismatch() {
+        if (!this.keyframes.size) return true;
+        const sizes = this._keyframeSizes();
+        const sizeOk = sizes.length === 1 && sizes[0][0] === this.frameW && sizes[0][1] === this.frameH;
+        const countOk = this.kfFrameCount === this.frameCount;
+        if (sizeOk && countOk) return true;
+        const choice = await showMismatchDialog({
+            inW: this.frameW, inH: this.frameH, inN: this.frameCount,
+            kfSizes: sizes, kfN: this.kfFrameCount, nKeyframes: this.keyframes.size,
+        });
+        if (choice.action === "cancel") return false;
+        this.history.clear();
+        this.redo.clear();
+        if (choice.action === "delete") {
+            this.keyframes.clear();
+            this.kfFrameCount = null;
+            return true;
+        }
+        const dropped = this._rescaleKeyframes(choice.oldCount, choice.method);
+        if (dropped > 0) {
+            await vmeAlert(
+                `${dropped} keyframe${dropped === 1 ? "" : "s"} landed on the same frame as another ` +
+                "after rescaling in time and " + (dropped === 1 ? "was" : "were") + " dropped " +
+                "(where keyframes collided, the one closest to that frame was kept).");
+        }
+        return true;
+    }
+
+    /** Resize every keyframe to the input's width/height and move it in
+     *  time from oldN frames to the input's frame count. Returns how many
+     *  keyframes were dropped because two landed on the same frame. */
+    _rescaleKeyframes(oldN, method) {
+        const newN = this.frameCount, W = this.frameW, H = this.frameH;
+        const rgb = this._hexToRgb(C.accent);
+        const out = new Map();
+        const err = new Map();     // new index -> |exact - rounded|
+        let dropped = 0;
+        for (const [f, id] of [...this.keyframes.entries()].sort((a, b) => a[0] - b[0])) {
+            const g = remapFrameIndex(f, oldN, newN);
+            const e = Math.abs(f * newN / oldN - g);
+            if (out.has(g)) {
+                dropped++;
+                if (err.get(g) <= e) continue;
+            }
+            const img = (id.width === W && id.height === H) ? id : resampleKeyframe(id, W, H, method, rgb);
+            out.set(g, img);
+            err.set(g, e);
+        }
+        this.keyframes = out;
+        this.kfFrameCount = newN;
+        return dropped;
+    }
+
+    /** Record the input's frame count the first time a keyframe exists. */
+    _noteKeyframeAdded() {
+        if (this.kfFrameCount == null) this.kfFrameCount = this.frameCount;
+    }
+
+    /** Decode a stored grayscale keyframe PNG at its own size into the
+     *  editor's RGBA form (mask in alpha, accent colour in RGB). */
+    async _decodeKeyframePng(blob) {
+        const bm = await createImageBitmap(blob, {
+            colorSpaceConversion: "none", premultiplyAlpha: "none",
+        });
+        const c = document.createElement("canvas");
+        c.width = bm.width; c.height = bm.height;
+        const cx = c.getContext("2d", { willReadFrequently: true });
+        cx.drawImage(bm, 0, 0);
+        bm.close?.();
+        const id = cx.getImageData(0, 0, c.width, c.height);
+        const accent = this._hexToRgb(C.accent);
+        for (let i = 0; i < id.data.length; i += 4) {
+            const a = id.data[i];
+            id.data[i] = accent.r; id.data[i + 1] = accent.g; id.data[i + 2] = accent.b;
+            id.data[i + 3] = a;
+        }
+        return id;
     }
 
     async _restoreFromWidget() {
@@ -252,7 +749,6 @@ class VMEEditor {
         let obj;
         try { obj = JSON.parse(w.value); } catch { return; }
         if (!obj || typeof obj !== "object") return;
-        const accent = this._hexToRgb(C.accent);
         for (const [fStr, b64] of Object.entries(obj)) {
             const f = parseInt(fStr, 10);
             if (!Number.isFinite(f)) continue;
@@ -261,44 +757,16 @@ class VMEEditor {
                 const bytes = new Uint8Array(bin.length);
                 for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
                 const blob = new Blob([bytes], { type: "image/png" });
-                const bm = await createImageBitmap(blob);
-                const c = document.createElement("canvas");
-                c.width = this.frameW; c.height = this.frameH;
-                const cx = c.getContext("2d");
-                cx.drawImage(bm, 0, 0, this.frameW, this.frameH);
-                const id = cx.getImageData(0, 0, this.frameW, this.frameH);
-                for (let i = 0; i < id.data.length; i += 4) {
-                    const a = id.data[i];
-                    id.data[i] = accent.r; id.data[i + 1] = accent.g; id.data[i + 2] = accent.b;
-                    id.data[i + 3] = a;
-                }
-                this.keyframes.set(f, id);
+                this.keyframes.set(f, await this._decodeKeyframePng(blob));
             } catch (e) { __c2cReport("video_mask_editor", e); }
         }
     }
 
     async _fetchExistingKeyframe(f) {
         try {
-            const r = await fetch(`/mec/video_mask_editor/keyframe?session=${encodeURIComponent(this.sessionId)}&frame=${f}`);
+            const r = await fetch(`/vme/keyframe?session=${encodeURIComponent(this.sessionId)}&frame=${f}`);
             if (!r.ok) return;
-            const blob = await r.blob();
-            const bm = await createImageBitmap(blob);
-            const c = document.createElement("canvas");
-            c.width = this.frameW; c.height = this.frameH;
-            const cx = c.getContext("2d");
-            cx.drawImage(bm, 0, 0, this.frameW, this.frameH);
-            // Convert grayscale L to RGBA red-tint mask.
-            const id = cx.getImageData(0, 0, this.frameW, this.frameH);
-            // Original L is in R==G==B; we want alpha = R, color = accent.
-            const accent = this._hexToRgb(C.accent);
-            for (let i = 0; i < id.data.length; i += 4) {
-                const a = id.data[i];
-                id.data[i] = accent.r;
-                id.data[i + 1] = accent.g;
-                id.data[i + 2] = accent.b;
-                id.data[i + 3] = a;
-            }
-            this.keyframes.set(f, id);
+            this.keyframes.set(f, await this._decodeKeyframePng(await r.blob()));
         } catch (e) { __c2cReport("video_mask_editor", e); }
     }
 
@@ -321,6 +789,7 @@ class VMEEditor {
         idx = Math.max(0, Math.min(this.frameCount - 1, idx | 0));
         if (!fresh) this._commitCurrent();
         this.curFrame = idx;
+        this.frames?.setFocus(idx);
         // Working buffer: start from pinned keyframe at this frame
         // if any, else from an empty mask. We do NOT auto-tween in the
         // editor — user is editing keyframes explicitly. (Tweening
@@ -340,6 +809,7 @@ class VMEEditor {
     _commitCurrent() {
         if (!this.curDirty || !this.curMask) return;
         this.keyframes.set(this.curFrame, this.curMask);
+        this._noteKeyframeAdded();
         this.curDirty = false;
     }
 
@@ -707,18 +1177,24 @@ class VMEEditor {
         ctx.translate(this.panX, this.panY);
         ctx.scale(this.zoom, this.zoom);
 
-        // Underlay: current video frame.
-        const frame = this.frameImgs[this.curFrame];
-        if (frame?.complete) {
+        // Underlay: current video frame (downscaled reference picture,
+        // stretched to the full frame size). While it loads, keep showing
+        // the last frame we had.
+        let frame = this.frames?.peek(this.curFrame) || null;
+        let frameIsCurrent = !!frame;
+        if (frame) {
+            this._shownIdx = this.curFrame;
+            if (this.frames) this.frames.protect = this.curFrame;
+        } else if (this._shownIdx >= 0) {
+            frame = this.frames?.peek(this._shownIdx) || null;
+        }
+        if (frame) {
             ctx.imageSmoothingEnabled = true;
             try { ctx.drawImage(frame, 0, 0, this.frameW, this.frameH); }
             catch (__c2cErr) { __c2cReport("video_mask_editor", __c2cErr); }
         } else {
             ctx.fillStyle = C.bg3;
             ctx.fillRect(0, 0, this.frameW, this.frameH);
-            ctx.fillStyle = C.sub;
-            ctx.font = "14px Inter, system-ui";
-            ctx.fillText("loading frame…", 12, 20);
         }
 
         // Onion skin: nearest pinned keyframes (one back, one forward).
@@ -838,6 +1314,18 @@ class VMEEditor {
 
         ctx.restore();
 
+        if (this.frames && (this.frames.stale || !frameIsCurrent)) {
+            const msg = this.frames.stale
+                ? "The node has run on a different input since this editor opened — reopen the editor."
+                : `loading frame ${this.curFrame + 1}…`;
+            ctx.font = "12px Inter, system-ui";
+            const tw = ctx.measureText(msg).width;
+            ctx.fillStyle = "rgba(17,17,27,0.8)";
+            ctx.fillRect(10, 10, tw + 16, 22);
+            ctx.fillStyle = this.frames.stale ? C.warn : C.sub;
+            ctx.fillText(msg, 18, 25);
+        }
+
         // Brush cursor outline.
         if ((this.tool === "brush" || this.tool === "erase") && this._cursor) {
             ctx.strokeStyle = this.tool === "erase" ? C.danger : C.accent;
@@ -857,11 +1345,14 @@ class VMEEditor {
     }
 
     _updateStatus() {
+        if (!this.dom.status) return;
         const pinned = this.keyframes.has(this.curFrame) || this.curDirty;
+        const loaded = this.frames ? this.frames.loadedCount() : 0;
         this.dom.status.textContent =
             `${this.frameW}×${this.frameH} · frame ${this.curFrame + 1}/${this.frameCount} · ` +
             `${pinned ? "📌 keyframe" : "blank"} · ${this.keyframes.size} pinned` +
-            (this.curDirty ? " · ●" : "");
+            (this.curDirty ? " · ●" : "") +
+            (this.frames && loaded < this.frameCount ? ` · frames loaded ${loaded}/${this.frameCount}` : "");
     }
 
     _updateSidebar() {
@@ -876,7 +1367,7 @@ class VMEEditor {
                 cursor:pointer;font-size:11px;border:1px solid transparent;
                 border-color:${f === this.curFrame ? C.accent + "55" : "transparent"};
             `;
-            row.onmouseenter = () => { if (f !== this.curFrame) row.style.background = "var(--c2c-panelTintAlt)"; };
+            row.onmouseenter = () => { if (f !== this.curFrame) row.style.background = C.rowHover; };
             row.onmouseleave = () => { row.style.background = f === this.curFrame ? C.accent + "22" : "transparent"; };
             const dot = document.createElement("span");
             dot.textContent = "📌";
@@ -964,12 +1455,13 @@ class VMEEditor {
             if (d[i] > 0) { any = true; break; }
         }
         if (!any) {
-            c2cAlert("Nothing to pin — paint a mask first.");
+            vmeAlert("Nothing to pin — paint a mask first.");
             return;
         }
         this.keyframes.set(this.curFrame,
             new ImageData(new Uint8ClampedArray(this.curMask.data),
                           this.curMask.width, this.curMask.height));
+        this._noteKeyframeAdded();
         this.curDirty = false;
         this.draw();
     }
@@ -984,13 +1476,13 @@ class VMEEditor {
     async save() {
         this._commitCurrent();
         // Init (idempotent) just in case shape changed.
-        await fetch(`/mec/video_mask_editor/init?session=${encodeURIComponent(this.sessionId)}`, {
+        await fetch(`/vme/init?session=${encodeURIComponent(this.sessionId)}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ h: this.frameH, w: this.frameW }),
         });
         // Clear and re-POST every keyframe (simple & correct).
-        await fetch(`/mec/video_mask_editor/clear?session=${encodeURIComponent(this.sessionId)}`, {
+        await fetch(`/vme/clear?session=${encodeURIComponent(this.sessionId)}`, {
             method: "POST",
         });
         let saved = 0;
@@ -998,7 +1490,7 @@ class VMEEditor {
         const sorted = [...this.keyframes.entries()].sort((a, b) => a[0] - b[0]);
         for (const [f, id] of sorted) {
             const blob = await this._maskToPngBlob(id);
-            const r = await fetch(`/mec/video_mask_editor/keyframe?session=${encodeURIComponent(this.sessionId)}&frame=${f}`, {
+            const r = await fetch(`/vme/keyframe?session=${encodeURIComponent(this.sessionId)}&frame=${f}`, {
                 method: "POST",
                 headers: { "Content-Type": "image/png" },
                 body: blob,
@@ -1010,6 +1502,11 @@ class VMEEditor {
         }
         const kfWidget = this._widget("keyframes_data");
         if (kfWidget) kfWidget.value = JSON.stringify(kfObj);
+        // Remember which frame count these keyframes belong to (0 = none).
+        const nWidget = this._widget("keyframe_frame_count");
+        if (nWidget) {
+            nWidget.value = this.keyframes.size ? (this.kfFrameCount ?? this.frameCount) : 0;
+        }
         return saved;
     }
 
@@ -1045,7 +1542,7 @@ function openModal(node) {
         position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
         width:min(1360px,90vw);height:min(880px,88vh);
         min-width:520px;min-height:380px;
-        z-index:var(--c2c-z-modal, 10000);
+        z-index:${Z_MODAL};
         background:${C.bg};color:${C.text};
         display:flex;flex-direction:column;
         border:1px solid ${C.border};border-radius:12px;overflow:hidden;resize:both;
@@ -1059,7 +1556,7 @@ function openModal(node) {
     const top = document.createElement("div");
     top.style.cssText = `
         display:flex;align-items:center;gap:8px;padding:8px 14px;
-        background:linear-gradient(${C.panel},var(--c2c-scrimDark5));
+        background:linear-gradient(${C.panel},${C.scrim5});
         border-bottom:1px solid ${C.border};flex:0 0 auto;flex-wrap:wrap;
     `;
     overlay.appendChild(top);
@@ -1085,7 +1582,7 @@ function openModal(node) {
             display:inline-flex;align-items:center;justify-content:center;gap:6px;
             transition:background .12s,border-color .12s,transform .05s;
         `;
-        b.onmouseenter = () => { b.style.background = opts.hover || "var(--c2c-panelBgAlt2)"; };
+        b.onmouseenter = () => { b.style.background = opts.hover || C.hover; };
         b.onmouseleave = () => { b.style.background = opts.bg || C.panel; };
         b.onmousedown = () => { b.style.transform = "scale(0.97)"; };
         b.onmouseup = () => { b.style.transform = "scale(1)"; };
@@ -1116,7 +1613,7 @@ function openModal(node) {
         for (const k in toolBtns) {
             const sel = k === id;
             toolBtns[k].style.background = sel ? C.accent : C.panel;
-            toolBtns[k].style.color = sel ? "var(--c2c-bg2)" : C.text;
+            toolBtns[k].style.color = sel ? C.bg2 : C.text;
             toolBtns[k].style.borderColor = sel ? C.accent : C.border;
         }
         ed.lasso = [];
@@ -1232,24 +1729,44 @@ function openModal(node) {
     btnFit.onclick = () => { ed.fitView(); ed.draw(); };
     top.appendChild(btnFit);
 
+    // Reference-picture size: smaller = faster loading, blurrier when
+    // zoomed in. Masks are always painted at full size regardless.
+    const prevSel = document.createElement("select");
+    prevSel.title = "Size of the video frames shown behind the mask (display only)";
+    prevSel.style.cssText = `height:30px;padding:0 6px;border-radius:5px;font-size:12px;
+        background:${C.panel};color:${C.text};border:1px solid ${C.border};cursor:pointer;`;
+    for (const [v, t] of PREVIEW_CHOICES) {
+        const o = document.createElement("option");
+        o.value = String(v); o.textContent = `Preview: ${t}`;
+        prevSel.appendChild(o);
+    }
+    if (!PREVIEW_CHOICES.some(([v]) => v === ed._previewMaxSide())) {
+        const o = document.createElement("option");
+        o.value = String(ed._previewMaxSide()); o.textContent = `Preview: ${ed._previewMaxSide()} px`;
+        prevSel.appendChild(o);
+    }
+    prevSel.value = String(ed._previewMaxSide());
+    prevSel.onchange = () => { ed.setPreviewMaxSide(Number(prevSel.value)); prevSel.blur(); };
+    top.appendChild(prevSel);
+
     top.appendChild(sep());
 
-    const btnPin = mkBtn("📌 Pin Keyframe", { title: "Pin current mask (K)", bg: "var(--c2c-okBg2)", hover: "var(--c2c-okBg)", fg: C.accent });
+    const btnPin = mkBtn("📌 Pin Keyframe", { title: "Pin current mask (K)", bg: C.okBg2, hover: C.okBg, fg: C.accent });
     btnPin.onclick = () => ed.pin();
     top.appendChild(btnPin);
 
-    const btnUnpin = mkBtn("✕ Unpin", { title: "Remove keyframe", bg: "var(--c2c-dangerBg2)", hover: "var(--c2c-dangerBg3)", fg: C.danger });
+    const btnUnpin = mkBtn("✕ Unpin", { title: "Remove keyframe", bg: C.dangerBg2, hover: C.dangerBg3, fg: C.danger });
     btnUnpin.onclick = () => ed.unpin();
     top.appendChild(btnUnpin);
 
     top.appendChild(sep());
 
     const btnSave = mkBtn("💾 Save & Close", { title: "Persist keyframes to server & close",
-        bg: C.accent, fg: "var(--c2c-scrimDark6)", border: C.accent, hover: "var(--c2c-okMid2)" });
+        bg: C.accent, fg: C.scrim6, border: C.accent, hover: C.okMid2 });
     top.appendChild(btnSave);
 
     const btnCancel = mkBtn("✕ Cancel", { title: "Discard changes & close",
-        bg: C.panel, hover: "var(--c2c-violetBgAlt)", fg: C.danger });
+        bg: C.panel, hover: C.violetBg, fg: C.danger });
     top.appendChild(btnCancel);
 
     // ── Body: canvas + sidebar ─────────────────────────────────────
@@ -1278,7 +1795,7 @@ function openModal(node) {
     const scrubCanvas = document.createElement("canvas");
     scrubCanvas.style.cssText = `
         position:absolute;left:0;right:0;bottom:0;height:36px;width:100%;
-        background:var(--c2c-bg3);border-top:1px solid ${C.border};cursor:pointer;
+        background:${C.bg4};border-top:1px solid ${C.border};cursor:pointer;
     `;
     viewport.appendChild(scrubCanvas);
 
@@ -1510,10 +2027,16 @@ function openModal(node) {
         scrubbing = true;
         ed._switchFrame(scrubXToFrame(e.clientX));
     });
-    window.addEventListener("mousemove", (e) => {
+    const onScrubMove = (e) => {
         if (scrubbing) ed._switchFrame(scrubXToFrame(e.clientX));
-    });
-    window.addEventListener("mouseup", () => { scrubbing = false; });
+    };
+    const onScrubUp = () => { scrubbing = false; };
+    window.addEventListener("mousemove", onScrubMove);
+    window.addEventListener("mouseup", onScrubUp);
+    // Keep the "frames loaded n/N" counter moving while frames stream in.
+    const statusTimer = setInterval(() => {
+        if (ed.frames && ed.frameCount) ed._updateStatus();
+    }, 400);
 
     // Resize observer.
     const ro = new ResizeObserver(() => ed.draw());
@@ -1526,6 +2049,9 @@ function openModal(node) {
         closing = true;
         window.removeEventListener("keydown", onKey);
         window.removeEventListener("keyup", onKey);
+        window.removeEventListener("mousemove", onScrubMove);
+        window.removeEventListener("mouseup", onScrubUp);
+        clearInterval(statusTimer);
         ro.disconnect();
         if (commit) {
             btnSave.disabled = true;
@@ -1535,7 +2061,7 @@ function openModal(node) {
                 console.log(`[VME] saved ${n} keyframes for session ${ed.sessionId}`);
             } catch (e) {
                 console.error("[VME] save failed:", e);
-                c2cAlert("Save failed:\n" + (e?.message || e));
+                vmeAlert("Save failed:\n" + (e?.message || e));
                 closing = false;
                 btnSave.disabled = false;
                 btnSave.innerHTML = "💾 Save & Close";
@@ -1544,6 +2070,7 @@ function openModal(node) {
             // Trigger a redraw of the node so the session_id field shows.
             ed.node.graph?.setDirtyCanvas(true, true);
         }
+        ed.frames?.dispose();
         document.body.removeChild(overlay);
     };
     btnSave.onclick = () => close(true);
@@ -1562,7 +2089,7 @@ function openModal(node) {
 
 // ─── Extension registration ─────────────────────────────────────────
 app.registerExtension({
-    name: "MEC.VideoMaskEditor",
+    name: "VideoMaskEditor.Editor",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== NODE_NAME) return;
         const origCreated = nodeType.prototype.onNodeCreated;
@@ -1575,7 +2102,8 @@ app.registerExtension({
                 if (w && (!w.value || w.value.length < 8)) {
                     w.value = uuid();
                 }
-                for (const name of ["keyframes_data", "brush_opacity", "brush_feather", "brush_size"]) {
+                for (const name of ["keyframes_data", "brush_opacity", "brush_feather", "brush_size",
+                                    "keyframe_frame_count"]) {
                     const hw = self.widgets?.find(w => w.name === name);
                     if (!hw) continue;
                     hw.computeSize = () => [0, -4];

@@ -1,7 +1,8 @@
 # Derived from nodes/mask_matting/refine_node.py in ComfyUI-CustomNodePacks
 # by Code2Collapse (Likhith) -- https://github.com/Code2Collapse
 # (https://github.com/Code2Collapse/ComfyUI-CustomNodePacks), Apache-2.0.
-# Modified: menu category changed; the integrity check now imports
+# Modified: moved up one package level (imports adjusted); menu category
+# changed; the integrity check now imports
 # compute_integrity from mask_integrity.py, and no longer publishes its report
 # to the original pack's diagnostics panel (which is not included here).
 """MaskRefineMEC — SINGLE training-free mask refinement node.
@@ -53,7 +54,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .._is_changed_util import hash_args_and_kwargs
+from ._is_changed_util import hash_args_and_kwargs
 
 log = logging.getLogger("MEC.MaskRefineMEC")
 
