@@ -95,6 +95,15 @@ function uuid() {
 // Implementation lives in _frame_finder.js and handles video sources,
 // sibling preview scan, and single-frame fallback.
 
+function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result).split(",")[1]);
+        r.onerror = reject;
+        r.readAsDataURL(blob);
+    });
+}
+
 function loadImage(url) {
     return new Promise((resolve, reject) => {
         const cached = loadImage.cache?.get(url);
@@ -131,7 +140,8 @@ class VMEEditor {
         this.tool = "brush";       // brush|erase|fill|lasso|rect|ellipse|polygon|star|line
         this.brushRadius = 30;
         this.brushOpacity = 1.0;
-        this.brushFeather = 0.6;
+        this.brushFeather = 0.0;   // default changed from 0.6 — crisp brush by default
+        this._loadBrushPrefsFromWidgets();
 
         // Shape-tool state (rect/ellipse/polygon/star/line)
         this.shapeStart = null;    // {x,y} in image coords — drag anchor
@@ -173,6 +183,26 @@ class VMEEditor {
         return w.value;
     }
 
+    _widget(name) {
+        return this.node.widgets?.find(w => w.name === name) || null;
+    }
+
+    _widgetNum(name, fallback) {
+        const v = this._widget(name)?.value;
+        return (typeof v === "number" && isFinite(v)) ? v : fallback;
+    }
+
+    _loadBrushPrefsFromWidgets() {
+        this.brushRadius = this._widgetNum("brush_size", this.brushRadius);
+        this.brushOpacity = this._widgetNum("brush_opacity", this.brushOpacity);
+        this.brushFeather = this._widgetNum("brush_feather", this.brushFeather);
+    }
+
+    _syncBrushPref(name, value) {
+        const w = this._widget(name);
+        if (w) w.value = value;
+    }
+
     // ── frame init / switch ──────────────────────────────────────────
     async loadFrames() {
         const urls = await findUpstreamFramesAsync(this.node, { maxVideoFrames: 32 });
@@ -209,8 +239,42 @@ class VMEEditor {
             const j = await r.json();
             for (const f of j.keyframes || []) await this._fetchExistingKeyframe(f);
         } catch (e) { __c2cReport("video_mask_editor", e); }
+        if (this.keyframes.size === 0) {
+            await this._restoreFromWidget();
+        }
         this._switchFrame(0, { fresh: true });
         return true;
+    }
+
+    async _restoreFromWidget() {
+        const w = this._widget("keyframes_data");
+        if (!w?.value) return;
+        let obj;
+        try { obj = JSON.parse(w.value); } catch { return; }
+        if (!obj || typeof obj !== "object") return;
+        const accent = this._hexToRgb(C.accent);
+        for (const [fStr, b64] of Object.entries(obj)) {
+            const f = parseInt(fStr, 10);
+            if (!Number.isFinite(f)) continue;
+            try {
+                const bin = atob(b64);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                const blob = new Blob([bytes], { type: "image/png" });
+                const bm = await createImageBitmap(blob);
+                const c = document.createElement("canvas");
+                c.width = this.frameW; c.height = this.frameH;
+                const cx = c.getContext("2d");
+                cx.drawImage(bm, 0, 0, this.frameW, this.frameH);
+                const id = cx.getImageData(0, 0, this.frameW, this.frameH);
+                for (let i = 0; i < id.data.length; i += 4) {
+                    const a = id.data[i];
+                    id.data[i] = accent.r; id.data[i + 1] = accent.g; id.data[i + 2] = accent.b;
+                    id.data[i + 3] = a;
+                }
+                this.keyframes.set(f, id);
+            } catch (e) { __c2cReport("video_mask_editor", e); }
+        }
     }
 
     async _fetchExistingKeyframe(f) {
@@ -930,6 +994,7 @@ class VMEEditor {
             method: "POST",
         });
         let saved = 0;
+        const kfObj = {};
         const sorted = [...this.keyframes.entries()].sort((a, b) => a[0] - b[0]);
         for (const [f, id] of sorted) {
             const blob = await this._maskToPngBlob(id);
@@ -938,8 +1003,13 @@ class VMEEditor {
                 headers: { "Content-Type": "image/png" },
                 body: blob,
             });
-            if (r.ok) saved++;
+            if (r.ok) {
+                saved++;
+                kfObj[f] = await blobToBase64(blob);
+            }
         }
+        const kfWidget = this._widget("keyframes_data");
+        if (kfWidget) kfWidget.value = JSON.stringify(kfObj);
         return saved;
     }
 
@@ -1087,11 +1157,11 @@ function openModal(node) {
         return wrap;
     };
     top.appendChild(sliderWrap("Size", 2, 200, ed.brushRadius, 1,
-        v => { ed.brushRadius = v; ed.draw(); }, "px"));
+        v => { ed.brushRadius = v; ed._syncBrushPref("brush_size", v); ed.draw(); }, "px"));
     top.appendChild(sliderWrap("Opacity", 5, 100, Math.round(ed.brushOpacity * 100), 1,
-        v => { ed.brushOpacity = v / 100; }, "%"));
+        v => { ed.brushOpacity = v / 100; ed._syncBrushPref("brush_opacity", ed.brushOpacity); }, "%"));
     top.appendChild(sliderWrap("Feather", 0, 100, Math.round(ed.brushFeather * 100), 1,
-        v => { ed.brushFeather = v / 100; }, "%"));
+        v => { ed.brushFeather = v / 100; ed._syncBrushPref("brush_feather", ed.brushFeather); }, "%"));
 
     // Shape params (polygon/star sides, star point sharpness, rotation).
     // Shown only while a shape tool is active (toggled in setTool).
@@ -1417,8 +1487,8 @@ function openModal(node) {
         if ((e.key === "F" || e.key === "f") && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
             ed.fitView(); ed.draw(); e.preventDefault(); e.stopImmediatePropagation(); return;
         }
-        if (e.key === "[") { ed.brushRadius = Math.max(2, ed.brushRadius - 4); ed.draw(); e.preventDefault(); return; }
-        if (e.key === "]") { ed.brushRadius = Math.min(200, ed.brushRadius + 4); ed.draw(); e.preventDefault(); return; }
+        if (e.key === "[") { ed.brushRadius = Math.max(2, ed.brushRadius - 4); ed._syncBrushPref("brush_size", ed.brushRadius); ed.draw(); e.preventDefault(); return; }
+        if (e.key === "]") { ed.brushRadius = Math.min(200, ed.brushRadius + 4); ed._syncBrushPref("brush_size", ed.brushRadius); ed.draw(); e.preventDefault(); return; }
         if (e.key === "ArrowLeft") { ed._switchFrame(ed.curFrame - 1); e.preventDefault(); return; }
         if (e.key === "ArrowRight") { ed._switchFrame(ed.curFrame + 1); e.preventDefault(); return; }
         if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey) && !e.shiftKey) { ed.undo(); e.preventDefault(); return; }
@@ -1505,6 +1575,14 @@ app.registerExtension({
                 if (w && (!w.value || w.value.length < 8)) {
                     w.value = uuid();
                 }
+                for (const name of ["keyframes_data", "brush_opacity", "brush_feather", "brush_size"]) {
+                    const hw = self.widgets?.find(w => w.name === name);
+                    if (!hw) continue;
+                    hw.computeSize = () => [0, -4];
+                    hw.type = "hidden";
+                    if (hw.element) hw.element.style.display = "none";
+                    if (hw.inputEl) hw.inputEl.style.display = "none";
+                }
             }, 0);
             // Add an "Open Editor" big button widget at the top.
             this.addWidget(
@@ -1517,3 +1595,4 @@ app.registerExtension({
         };
     },
 });
+

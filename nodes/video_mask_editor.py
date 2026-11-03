@@ -28,6 +28,26 @@ INPUTS (optional):
   input_mask     MASK    fallback mask (used for any frame that has no
                           pinned/tween value because the user hasn't
                           set any keyframes). Shape (B|1,H,W).
+  keyframes_data STRING  JSON {frame: base64 PNG}, written by the editor
+                          UI on Save. This is the durable copy of your
+                          pinned keyframes: it travels with the saved
+                          workflow, so edits survive a server restart or
+                          opening the workflow elsewhere (the live
+                          in-memory session store below does not). When
+                          present and non-empty it takes priority over
+                          the in-memory session; it also changes value on
+                          every Save, which is what lets IS_CHANGED
+                          correctly invalidate the node's cache when
+                          keyframes are edited.
+  brush_opacity  FLOAT   editor brush opacity, remembered across
+                          re-opens. Cosmetic only — excluded from
+                          IS_CHANGED.
+  brush_feather  FLOAT   editor brush edge softness, remembered across
+                          re-opens. Cosmetic only — excluded from
+                          IS_CHANGED. Default 0 (crisp brush).
+  brush_size     INT     editor brush radius (px), remembered across
+                          re-opens. Cosmetic only — excluded from
+                          IS_CHANGED.
 
 OUTPUTS:
   mask           MASK    (B,H,W) float32 in [0,1]
@@ -38,6 +58,7 @@ VRAM tier: 0 (CPU-only).
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import threading
@@ -122,6 +143,32 @@ def _mask_to_png(arr: np.ndarray) -> bytes:
     buf = io.BytesIO()
     im.save(buf, format="PNG", optimize=False, compress_level=3)
     return buf.getvalue()
+
+
+def _decode_keyframes_field(raw: str) -> Dict[int, np.ndarray]:
+    """Decode the keyframes_data widget's JSON payload — {frame: base64
+    PNG} — into the same {frame_int: uint8 (H,W) mask} shape the live
+    session store uses. Reuses the same grayscale PNG codec as the
+    HTTP keyframe routes. Malformed/empty input yields {}; individual
+    bad entries are skipped rather than failing the whole batch.
+    """
+    out: Dict[int, np.ndarray] = {}
+    if not raw:
+        return out
+    try:
+        obj = json.loads(raw)
+    except (TypeError, ValueError):
+        return out
+    if not isinstance(obj, dict):
+        return out
+    for k, v in obj.items():
+        try:
+            frame = int(k)
+            png_bytes = base64.b64decode(v)
+            out[frame] = _png_to_mask(png_bytes)
+        except Exception:
+            continue
+    return out
 
 
 # ─── Tween implementations ───────────────────────────────────────────
@@ -470,6 +517,30 @@ class VideoMaskEditorMEC:
                 "input_mask": ("MASK", {
                     "tooltip": "Fallback mask used if no keyframes are set.",
                 }),
+                "keyframes_data": ("STRING", {
+                    "default": "", "multiline": True,
+                    "tooltip": (
+                        "Internal: JSON {frame: base64 PNG} of your pinned "
+                        "keyframes, written by the editor on Save. Persists "
+                        "your edits inside the saved workflow. Don't edit "
+                        "by hand."
+                    ),
+                }),
+                "brush_size": ("INT", {
+                    "default": 30, "min": 2, "max": 200, "step": 1,
+                    "tooltip": "Editor brush radius (px). Remembers your "
+                               "last value; has no effect on node output.",
+                }),
+                "brush_opacity": ("FLOAT", {
+                    "default": 1.0, "min": 0.05, "max": 1.0, "step": 0.01,
+                    "tooltip": "Editor brush opacity. Remembers your last "
+                               "value; has no effect on node output.",
+                }),
+                "brush_feather": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "Editor brush edge softness. Remembers your "
+                               "last value; has no effect on node output.",
+                }),
             },
         }
 
@@ -479,10 +550,11 @@ class VideoMaskEditorMEC:
 
     @classmethod
     def IS_CHANGED(cls, image, session_id, tween_mode, feather, threshold,
-                   input_mask=None, **kwargs):
+                   input_mask=None, keyframes_data="", brush_opacity=1.0,
+                   brush_feather=0.0, brush_size=30, **kwargs):
         return hash_args_and_kwargs(
             image, session_id, tween_mode, feather, threshold, input_mask,
-            **kwargs,
+            keyframes_data, **kwargs,
         )
 
     def execute(
@@ -493,6 +565,10 @@ class VideoMaskEditorMEC:
         feather: float,
         threshold: float,
         input_mask: Optional[torch.Tensor] = None,
+        keyframes_data: str = "",
+        brush_opacity: float = 1.0,
+        brush_feather: float = 0.0,
+        brush_size: int = 30,
     ):
         if image is None or not isinstance(image, torch.Tensor) or image.ndim != 4:
             raise ValueError("VideoMaskEditorMEC: image must be IMAGE tensor [B,H,W,C]")
@@ -506,6 +582,7 @@ class VideoMaskEditorMEC:
         with torch.inference_mode():
             return self._execute_impl(
                 image, session_id, tween_mode, feather, threshold, input_mask,
+                keyframes_data,
             )
 
     def _execute_impl(
@@ -516,6 +593,7 @@ class VideoMaskEditorMEC:
         feather: float,
         threshold: float,
         input_mask: Optional[torch.Tensor] = None,
+        keyframes_data: str = "",
     ):
         B, H, W, _C = image.shape
         sid = (session_id or "").strip()
@@ -525,12 +603,23 @@ class VideoMaskEditorMEC:
                 "in-browser editor at least once so it can assign a UUID."
             )
 
-        # Pull keyframes from the session store.
-        s = _get_session(sid)
-        kfs: Dict[int, np.ndarray] = {}
-        if s is not None:
-            with s["lock"]:
-                kfs = dict(s["keyframes"])
+        # Prefer the workflow-embedded keyframes (durable: survives a
+        # server restart, works from a pure-API queue with no browser
+        # involved, portable if the workflow is shared/moved). The JS
+        # editor keeps this in lockstep with the live session on every
+        # Save, so under normal use the two never disagree — this only
+        # matters as a fallback when the in-memory session is gone.
+        kf_source = "none"
+        kfs: Dict[int, np.ndarray] = _decode_keyframes_field(keyframes_data)
+        if kfs:
+            kf_source = "workflow"
+        else:
+            s = _get_session(sid)
+            if s is not None:
+                with s["lock"]:
+                    kfs = dict(s["keyframes"])
+                if kfs:
+                    kf_source = "session"
 
         # Fallback mask: take first slice of input_mask, if any.
         fallback: Optional[np.ndarray] = None
@@ -562,6 +651,7 @@ class VideoMaskEditorMEC:
         info = json.dumps({
             "session": sid[:8] + "…" if len(sid) > 8 else sid,
             "n_keyframes": len(kfs),
+            "kf_source": kf_source,
             "frames": B,
             "shape": [H, W],
             "tween_mode": tween_mode,
