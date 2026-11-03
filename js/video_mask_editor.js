@@ -1976,7 +1976,7 @@ function openModal(node) {
     const onKey = (e) => {
         if (e.key === " ") { spaceDown = (e.type === "keydown"); e.preventDefault(); return; }
         if (e.type !== "keydown") return;
-        if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+        if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT")) return;
         if (e.key === "Escape") {
             if (ed.tool === "pen" && ed.penPoints.length) { ed.penPoints = []; ed.penHover = null; ed.penDragIdx = -1; ed.draw(); e.preventDefault(); return; }
             close(false); e.preventDefault(); return;

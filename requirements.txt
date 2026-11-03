@@ -1,0 +1,13 @@
+# torch, numpy and Pillow are provided by ComfyUI; don't reinstall them.
+
+# Recommended: Video Mask Editor uses OpenCV for shape-aware interpolation
+# between keyframes and for resizing preview frames; Mask Refiner uses it
+# for most of its stages.
+opencv-python>=4.7.0
+# Mask Refiner: hole filling and other stages.
+scipy>=1.10.0
+
+# Optional extras for some Mask Refiner stages (skipped when missing):
+#   opencv-contrib-python   (joint bilateral filter; replaces opencv-python)
+#   scikit-image            (thin-structure recovery)
+#   pydensecrf              (DenseCRF stage)
