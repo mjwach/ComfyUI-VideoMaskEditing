@@ -1,3 +1,9 @@
+# Derived from nodes/mask_matting/refine_node.py in ComfyUI-CustomNodePacks
+# by Code2Collapse (Likhith) -- https://github.com/Code2Collapse
+# (https://github.com/Code2Collapse/ComfyUI-CustomNodePacks), Apache-2.0.
+# Modified: menu category changed; the integrity check now imports
+# compute_integrity from mask_integrity.py, and no longer publishes its report
+# to the original pack's diagnostics panel (which is not included here).
 """MaskRefineMEC — SINGLE training-free mask refinement node.
 
 Consolidates all post-segmentation mask cleanup techniques into ONE node.
@@ -448,7 +454,7 @@ class MaskRefineMEC:
         "pydensecrf (DenseCRF). Each missing dep silently disables only "
         "its stage; the rest still run."
     )
-    CATEGORY = "C2C/Pipeline"
+    CATEGORY = "mask"
     FUNCTION = "execute"
     RETURN_TYPES = ("MASK", "MASK", "IMAGE", "STRING")
     RETURN_NAMES = ("mask", "alpha", "preview", "info")
@@ -1067,7 +1073,7 @@ class MaskRefineMEC:
 
         if enable_integrity_check:
             try:
-                from .temporal_node import compute_integrity
+                from .mask_integrity import compute_integrity
                 _mask_for_integrity = out_t if out_t.dim() == 3 else out_t.unsqueeze(0)
                 integ = compute_integrity(
                     _mask_for_integrity,
@@ -1075,17 +1081,6 @@ class MaskRefineMEC:
                     jump_threshold=float(integrity_jump_threshold),
                 )
                 info_payload["integrity"] = integ
-                try:
-                    from .integrity_bridge import publish as _integrity_publish
-                    extra = {}
-                    frames_arr = integ.get("frames", [])
-                    if isinstance(frames_arr, list) and frames_arr:
-                        extra["area"] = [float(f.get("area", 0.0)) for f in frames_arr]
-                        extra["centroid_dx"] = [float(f.get("centroid_delta", 0.0)) for f in frames_arr]
-                        extra["iou_prev"] = [float(f.get("iou_prev", 1.0)) for f in frames_arr]
-                    _integrity_publish("MaskRefineMEC", integ, extra)
-                except Exception:
-                    pass
             except Exception as _e:  # pragma: no cover - defensive
                 info_payload["integrity_error"] = str(_e)
 

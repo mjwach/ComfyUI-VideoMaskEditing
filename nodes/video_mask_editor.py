@@ -1,3 +1,12 @@
+# Derived from nodes/video_mask_editor.py in ComfyUI-CustomNodePacks
+# by Code2Collapse (Likhith) -- https://github.com/Code2Collapse
+# (https://github.com/Code2Collapse/ComfyUI-CustomNodePacks), Apache-2.0.
+# Modified (see CHANGES.md for details): keyframes persisted in the workflow;
+# brush settings remembered; the node now serves its own downscaled reference
+# frames to the editor (no Preview Image node needed); it remembers the frame
+# count its keyframes were made for and refuses to run on an input whose size
+# or length no longer matches them; routes moved to /vme/*; menu category
+# changed.
 """
 VideoMaskEditorMEC
 ==================
@@ -48,6 +57,23 @@ INPUTS (optional):
   brush_size     INT     editor brush radius (px), remembered across
                           re-opens. Cosmetic only — excluded from
                           IS_CHANGED.
+  keyframe_frame_count
+                 INT     frame count of the input the keyframes were made
+                          for (0 = unknown, e.g. keyframes saved by older
+                          versions). Written by the editor. Together with
+                          the keyframe PNGs' own width/height it lets the
+                          editor notice a changed input and offer to
+                          rescale the keyframes.
+  preview_max_size
+                 INT     longest side, in pixels, of the reference frames
+                          the editor shows (0 = full resolution). Display
+                          only; masks are always painted at full size.
+
+REFERENCE FRAMES:
+  Each execute() remembers the input batch (a reference to the tensor, not
+  a copy) under the node's session id. The editor fetches frames from
+  /vme/frames/* one at a time, downscaled and JPEG-encoded on demand, so no
+  Preview Image node is needed and big videos stay cheap to browse.
 
 OUTPUTS:
   mask           MASK    (B,H,W) float32 in [0,1]
@@ -58,11 +84,14 @@ VRAM tier: 0 (CPU-only).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
 import threading
 import time
+import uuid
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -124,6 +153,96 @@ def _get_session(session_id: str, create: bool = False) -> Optional[dict]:
         if s is not None:
             s["ts"] = time.time()
         return s
+
+
+# ─── Reference-frame store (what the editor displays) ────────────────
+# {session_id: {"image": IMAGE tensor (B,H,W,C), "token": str, "ts": float}}
+# Holds a reference to the tensor ComfyUI already has in memory (no copy).
+# Only the most recently executed few sessions are kept so an old input
+# isn't held in RAM indefinitely.
+_FRAMES: "OrderedDict[str, dict]" = OrderedDict()
+_FRAMES_LOCK = threading.Lock()
+_FRAMES_MAX_SESSIONS = 3
+
+# Encoded JPEG cache: {(token, index, max_side): bytes}, LRU, byte-capped.
+_JPEG_CACHE: "OrderedDict[tuple, bytes]" = OrderedDict()
+_JPEG_CACHE_BYTES = 0
+_JPEG_CACHE_MAX_BYTES = 256 * 1024 * 1024
+_JPEG_QUALITY = 85
+
+
+def _store_frames(session_id: str, image: torch.Tensor) -> str:
+    """Remember `image` as the reference video for this session."""
+    with _FRAMES_LOCK:
+        prev = _FRAMES.get(session_id)
+        if prev is not None and prev["image"] is image:
+            token = prev["token"]
+        else:
+            token = uuid.uuid4().hex[:12]
+        _FRAMES[session_id] = {"image": image, "token": token, "ts": time.time()}
+        _FRAMES.move_to_end(session_id)
+        while len(_FRAMES) > _FRAMES_MAX_SESSIONS:
+            _FRAMES.popitem(last=False)
+        return token
+
+
+def _get_frames(session_id: str) -> Optional[dict]:
+    with _FRAMES_LOCK:
+        entry = _FRAMES.get(session_id)
+        if entry is not None:
+            _FRAMES.move_to_end(session_id)
+        return entry
+
+
+def _encode_frame_jpeg(image: torch.Tensor, index: int, max_side: int) -> bytes:
+    """Frame `index` of an IMAGE batch -> JPEG bytes, longest side <= max_side
+    (0 = full size). Runs in a worker thread."""
+    frame = image[index].detach()
+    if frame.device.type != "cpu":
+        frame = frame.cpu()
+    arr = (frame.float().clamp(0.0, 1.0).numpy() * 255.0 + 0.5).astype(np.uint8)
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    c = arr.shape[2]
+    if c == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    elif c == 2:
+        arr = np.repeat(arr[:, :, :1], 3, axis=2)
+    elif c > 3:
+        arr = arr[:, :, :3]
+    h, w = arr.shape[:2]
+    if max_side > 0 and max(h, w) > max_side:
+        scale = max_side / float(max(h, w))
+        nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+        if _HAS_CV2:
+            arr = cv2.resize(arr, (nw, nh), interpolation=cv2.INTER_AREA)
+        else:
+            arr = np.asarray(Image.fromarray(arr, mode="RGB").resize(
+                (nw, nh), Image.BILINEAR, reducing_gap=2.0))
+    buf = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(arr), mode="RGB").save(
+        buf, format="JPEG", quality=_JPEG_QUALITY)
+    return buf.getvalue()
+
+
+def _cached_frame_jpeg(image: torch.Tensor, token: str, index: int,
+                       max_side: int) -> bytes:
+    global _JPEG_CACHE_BYTES
+    key = (token, index, max_side)
+    with _FRAMES_LOCK:
+        data = _JPEG_CACHE.get(key)
+        if data is not None:
+            _JPEG_CACHE.move_to_end(key)
+            return data
+    data = _encode_frame_jpeg(image, index, max_side)
+    with _FRAMES_LOCK:
+        if key not in _JPEG_CACHE:
+            _JPEG_CACHE[key] = data
+            _JPEG_CACHE_BYTES += len(data)
+            while _JPEG_CACHE_BYTES > _JPEG_CACHE_MAX_BYTES and _JPEG_CACHE:
+                _, old = _JPEG_CACHE.popitem(last=False)
+                _JPEG_CACHE_BYTES -= len(old)
+    return data
 
 
 # ─── PNG codec helpers ───────────────────────────────────────────────
@@ -285,16 +404,16 @@ _TWEEN_FUNCS = {
 
 # ─── aiohttp route registration ──────────────────────────────────────
 def register_routes(server) -> None:
-    """Bind /mec/video_mask_editor/* routes."""
+    """Bind /vme/* routes."""
     try:
         from aiohttp import web
     except Exception:
-        print("[MEC.VideoMaskEditor] aiohttp not available; routes disabled.")
+        print("[VideoMaskEditor] aiohttp not available; routes disabled.")
         return
 
     routes = server.routes
 
-    @routes.post("/mec/video_mask_editor/init")
+    @routes.post("/vme/init")
     async def init_session(request):
         sid = request.rel_url.query.get("session", "").strip()
         if not sid:
@@ -316,7 +435,7 @@ def register_routes(server) -> None:
         _gc_sessions()
         return web.json_response({"ok": True, "shape": [h, w]})
 
-    @routes.post("/mec/video_mask_editor/keyframe")
+    @routes.post("/vme/keyframe")
     async def set_keyframe(request):
         sid = request.rel_url.query.get("session", "").strip()
         frame_s = request.rel_url.query.get("frame", "")
@@ -343,7 +462,7 @@ def register_routes(server) -> None:
             "ok": True, "frame": frame, "n_keyframes": len(s["keyframes"]),
         })
 
-    @routes.delete("/mec/video_mask_editor/keyframe")
+    @routes.delete("/vme/keyframe")
     async def del_keyframe(request):
         sid = request.rel_url.query.get("session", "").strip()
         frame_s = request.rel_url.query.get("frame", "")
@@ -357,7 +476,7 @@ def register_routes(server) -> None:
             n = len(s["keyframes"])
         return web.json_response({"ok": True, "n_keyframes": n})
 
-    @routes.get("/mec/video_mask_editor/state")
+    @routes.get("/vme/state")
     async def get_state(request):
         sid = request.rel_url.query.get("session", "").strip()
         if not sid:
@@ -372,7 +491,7 @@ def register_routes(server) -> None:
                 "n_keyframes": len(s["keyframes"]),
             })
 
-    @routes.get("/mec/video_mask_editor/keyframe")
+    @routes.get("/vme/keyframe")
     async def get_keyframe(request):
         sid = request.rel_url.query.get("session", "").strip()
         frame_s = request.rel_url.query.get("frame", "")
@@ -387,7 +506,7 @@ def register_routes(server) -> None:
             return web.Response(status=404)
         return web.Response(body=_mask_to_png(arr), content_type="image/png")
 
-    @routes.post("/mec/video_mask_editor/clear")
+    @routes.post("/vme/clear")
     async def clear_session(request):
         sid = request.rel_url.query.get("session", "").strip()
         if not sid:
@@ -398,7 +517,50 @@ def register_routes(server) -> None:
                 s["keyframes"].clear()
         return web.json_response({"ok": True})
 
-    print("[MEC.VideoMaskEditor] routes registered (/mec/video_mask_editor/*)")
+    @routes.get("/vme/frames/info")
+    async def frames_info(request):
+        sid = request.rel_url.query.get("session", "").strip()
+        entry = _get_frames(sid) if sid else None
+        if entry is None:
+            return web.json_response({"error": "no_frames"}, status=404)
+        img = entry["image"]
+        return web.json_response({
+            "frames": int(img.shape[0]),
+            "height": int(img.shape[1]),
+            "width": int(img.shape[2]),
+            "token": entry["token"],
+        })
+
+    @routes.get("/vme/frames/frame")
+    async def frames_frame(request):
+        q = request.rel_url.query
+        sid = q.get("session", "").strip()
+        token = q.get("token", "")
+        try:
+            index = int(q.get("i", ""))
+            max_side = max(0, min(16384, int(q.get("max", "0"))))
+        except ValueError:
+            return web.json_response({"error": "bad i/max"}, status=400)
+        entry = _get_frames(sid) if sid else None
+        if entry is None:
+            return web.json_response({"error": "no_frames"}, status=404)
+        if token and token != entry["token"]:
+            # The node ran again on a different input since the editor opened.
+            return web.json_response({"error": "stale"}, status=409)
+        img = entry["image"]
+        if index < 0 or index >= int(img.shape[0]):
+            return web.json_response({"error": "frame out of range"}, status=400)
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(
+                None, _cached_frame_jpeg, img, entry["token"], index, max_side)
+        except Exception as e:  # pragma: no cover - defensive
+            return web.json_response({"error": f"encode: {e}"}, status=500)
+        return web.Response(body=data, content_type="image/jpeg", headers={
+            "Cache-Control": "private, max-age=86400",
+        })
+
+    print("[VideoMaskEditor] routes registered (/vme/*)")
 
 
 # ─── Mask reconstruction (used by execute) ───────────────────────────
@@ -474,18 +636,46 @@ def _gaussian_feather(mask: np.ndarray, sigma: float) -> np.ndarray:
     return cv2.GaussianBlur(mask, (k, k), sigma).astype(np.float32) / 255.0
 
 
+def _check_keyframes_match(kfs: Dict[int, np.ndarray], n_frames: int,
+                           h: int, w: int, kf_frame_count: int) -> None:
+    """Refuse to run when the keyframes were made for a different input.
+
+    Width/height come from the keyframe masks themselves; the frame count
+    from the keyframe_frame_count widget (0 = unknown, not checked)."""
+    if not kfs:
+        return
+    problems = []
+    sizes = sorted({(int(m.shape[1]), int(m.shape[0])) for m in kfs.values()})
+    if sizes != [(w, h)]:
+        made = ", ".join(f"{a}x{b}" for a, b in sizes)
+        problems.append(f"keyframes are {made} but the input is {w}x{h}")
+    if kf_frame_count > 0 and kf_frame_count != n_frames:
+        problems.append(f"keyframes were made for {kf_frame_count} frames "
+                        f"but the input has {n_frames}")
+    if problems:
+        raise ValueError(
+            "Video Mask Editor: the input video changed since the keyframes "
+            "were made (" + "; ".join(problems) + "). Open the editor to "
+            "rescale or delete the keyframes, then run again."
+        )
+
+
 # ─── ComfyUI Node ────────────────────────────────────────────────────
 class VideoMaskEditorMEC:
     """Pinpoint per-frame mask editing across an entire video batch."""
 
     VRAM_TIER = 0
-    CATEGORY = "C2C/VideoMask"
+    CATEGORY = "mask"
     DESCRIPTION = (
         "Open the in-browser video mask editor (brush / erase / fill / "
         "lasso / onion-skin) to pin per-frame keyframes, then tweens "
-        "non-keyframed frames using distance-transform interpolation."
+        "non-keyframed frames using distance-transform interpolation. "
+        "Run the node once (it is an output node, so you can run just it) "
+        "to give the editor the input frames."
     )
-    OUTPUT_NODE = False
+    # An output node so it can be run on its own ("queue selected output
+    # nodes") just to load the input frames into the editor.
+    OUTPUT_NODE = True
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -541,6 +731,19 @@ class VideoMaskEditorMEC:
                     "tooltip": "Editor brush edge softness. Remembers your "
                                "last value; has no effect on node output.",
                 }),
+                "keyframe_frame_count": ("INT", {
+                    "default": 0, "min": 0, "max": 1000000, "step": 1,
+                    "tooltip": "Internal: frame count of the input the "
+                               "keyframes were made for (0 = unknown). "
+                               "Written by the editor.",
+                }),
+                "preview_max_size": ("INT", {
+                    "default": 1024, "min": 0, "max": 16384, "step": 64,
+                    "tooltip": "Longest side (px) of the reference frames "
+                               "shown in the editor; 0 = full resolution. "
+                               "Smaller loads faster. Display only: masks "
+                               "are always painted at the input's full size.",
+                }),
             },
         }
 
@@ -551,10 +754,11 @@ class VideoMaskEditorMEC:
     @classmethod
     def IS_CHANGED(cls, image, session_id, tween_mode, feather, threshold,
                    input_mask=None, keyframes_data="", brush_opacity=1.0,
-                   brush_feather=0.0, brush_size=30, **kwargs):
+                   brush_feather=0.0, brush_size=30, keyframe_frame_count=0,
+                   preview_max_size=1024, **kwargs):
         return hash_args_and_kwargs(
             image, session_id, tween_mode, feather, threshold, input_mask,
-            keyframes_data, **kwargs,
+            keyframes_data, keyframe_frame_count, **kwargs,
         )
 
     def execute(
@@ -569,6 +773,8 @@ class VideoMaskEditorMEC:
         brush_opacity: float = 1.0,
         brush_feather: float = 0.0,
         brush_size: int = 30,
+        keyframe_frame_count: int = 0,
+        preview_max_size: int = 1024,
     ):
         if image is None or not isinstance(image, torch.Tensor) or image.ndim != 4:
             raise ValueError("VideoMaskEditorMEC: image must be IMAGE tensor [B,H,W,C]")
@@ -582,7 +788,7 @@ class VideoMaskEditorMEC:
         with torch.inference_mode():
             return self._execute_impl(
                 image, session_id, tween_mode, feather, threshold, input_mask,
-                keyframes_data,
+                keyframes_data, keyframe_frame_count,
             )
 
     def _execute_impl(
@@ -594,6 +800,7 @@ class VideoMaskEditorMEC:
         threshold: float,
         input_mask: Optional[torch.Tensor] = None,
         keyframes_data: str = "",
+        keyframe_frame_count: int = 0,
     ):
         B, H, W, _C = image.shape
         sid = (session_id or "").strip()
@@ -602,6 +809,10 @@ class VideoMaskEditorMEC:
                 "VideoMaskEditorMEC: session_id is empty. Open the node's "
                 "in-browser editor at least once so it can assign a UUID."
             )
+
+        # Hand the input to the editor before anything below can fail, so
+        # the editor can always open (e.g. to fix mismatched keyframes).
+        _store_frames(sid, image)
 
         # Prefer the workflow-embedded keyframes (durable: survives a
         # server restart, works from a pure-API queue with no browser
@@ -620,6 +831,8 @@ class VideoMaskEditorMEC:
                     kfs = dict(s["keyframes"])
                 if kfs:
                     kf_source = "session"
+
+        _check_keyframes_match(kfs, B, H, W, int(keyframe_frame_count or 0))
 
         # Fallback mask: take first slice of input_mask, if any.
         fallback: Optional[np.ndarray] = None
@@ -654,6 +867,7 @@ class VideoMaskEditorMEC:
             "kf_source": kf_source,
             "frames": B,
             "shape": [H, W],
+            "keyframe_frame_count": int(keyframe_frame_count or 0),
             "tween_mode": tween_mode,
             "feather": float(feather),
             "threshold": float(threshold),
