@@ -40,7 +40,10 @@ and vendored third-party code.
   the pinned keyframes as base64 PNGs, so they survive a server restart and
   travel with the workflow. It takes priority over the in-memory session.
 - **Brush settings remembered.** Brush size, opacity and feather are kept in
-  hidden inputs. Feather now defaults to 0.
+  the node's properties, which are saved with the workflow but never sent to
+  the backend. As node inputs (an intermediate version) any change to them
+  made ComfyUI re-run the node and everything downstream. Workflows saved
+  with those inputs are converted when loaded. Feather now defaults to 0.
 - **Frames come from the node itself.** The editor used to find its frames
   in an upstream preview (in practice a Preview Image node holding every
   frame). Now each run of the node remembers its input, and the editor
@@ -49,9 +52,9 @@ and vendored third-party code.
   outward from the current frame, with only a small window decoded in the
   browser at a time. A new Preview size menu in the editor (stored as a node
   property, not an input) sets the downscaling.
-- **Keyframe dimension memory and rescaling.** A new hidden
-  `keyframe_frame_count` input records the input's frame count when
-  keyframes are first added. When the editor opens on an input whose
+- **Keyframe dimension memory and rescaling.** The input's frame count is
+  recorded when keyframes are first added, stored as a `_frame_count` entry
+  inside `keyframes_data`. When the editor opens on an input whose
   width, height or frame count differs from the keyframes', a dialog offers
   Cancel, Delete all keyframes, or Rescale (nearest-neighbor or bilinear;
   frame indices scaled by new/old count and rounded). Keyframes are now

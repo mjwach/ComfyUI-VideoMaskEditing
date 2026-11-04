@@ -61,6 +61,22 @@ function __c2cReport(where, err) {
     console.warn(`[VideoMaskEditor] ${where}:`, err);
 }
 
+// Node properties holding the editor's brush settings.
+const BRUSH_PROPS = {
+    brush_size: "vme_brush_size",
+    brush_opacity: "vme_brush_opacity",
+    brush_feather: "vme_brush_feather",
+};
+
+/** keyframes_data's "_frame_count" (null when absent or invalid). */
+function readKeyframeFrameCount(raw) {
+    if (!raw) return null;
+    try {
+        const n = JSON.parse(raw)?._frame_count;
+        return (Number.isInteger(n) && n > 0) ? n : null;
+    } catch { return null; }
+}
+
 const HISTORY_LIMIT = 60;
 
 // ─── UUID generator (RFC4122 v4, crypto if available) ────────────────
@@ -522,8 +538,8 @@ class VMEEditor {
         this.keyframes = new Map();
         // Frame count of the input the keyframes were made for (null =
         // unknown). Width/height come from the keyframes themselves.
-        const kfn = this._widget("keyframe_frame_count")?.value;
-        this.kfFrameCount = (typeof kfn === "number" && kfn > 0) ? kfn : null;
+        // Stored as "_frame_count" inside keyframes_data.
+        this.kfFrameCount = readKeyframeFrameCount(this._widget("keyframes_data")?.value);
         this.curMask = null;       // ImageData for current frame's working buffer
         this.curDirty = false;
         // Tool state
@@ -582,15 +598,20 @@ class VMEEditor {
         return (typeof v === "number" && isFinite(v)) ? v : fallback;
     }
 
+    // Brush settings are editor-only, so they live in the node's properties
+    // (saved with the workflow, never sent to the backend). As inputs they
+    // made the node and everything downstream re-run when changed.
     _loadBrushPrefsFromWidgets() {
-        this.brushRadius = this._widgetNum("brush_size", this.brushRadius);
-        this.brushOpacity = this._widgetNum("brush_opacity", this.brushOpacity);
-        this.brushFeather = this._widgetNum("brush_feather", this.brushFeather);
+        const p = this.node.properties || {};
+        const num = (k, fb) => (typeof p[k] === "number" && isFinite(p[k])) ? p[k] : fb;
+        this.brushRadius = num(BRUSH_PROPS.brush_size, this.brushRadius);
+        this.brushOpacity = num(BRUSH_PROPS.brush_opacity, this.brushOpacity);
+        this.brushFeather = num(BRUSH_PROPS.brush_feather, this.brushFeather);
     }
 
     _syncBrushPref(name, value) {
-        const w = this._widget(name);
-        if (w) w.value = value;
+        if (!this.node.properties) this.node.properties = {};
+        this.node.properties[BRUSH_PROPS[name]] = value;
     }
 
     // ── frame init / switch ──────────────────────────────────────────
@@ -750,8 +771,8 @@ class VMEEditor {
         try { obj = JSON.parse(w.value); } catch { return; }
         if (!obj || typeof obj !== "object") return;
         for (const [fStr, b64] of Object.entries(obj)) {
+            if (!/^\d+$/.test(fStr)) continue;   // e.g. "_frame_count"
             const f = parseInt(fStr, 10);
-            if (!Number.isFinite(f)) continue;
             try {
                 const bin = atob(b64);
                 const bytes = new Uint8Array(bin.length);
@@ -1500,13 +1521,10 @@ class VMEEditor {
                 kfObj[f] = await blobToBase64(blob);
             }
         }
+        // Remember which frame count these keyframes belong to.
+        if (this.keyframes.size) kfObj._frame_count = this.kfFrameCount ?? this.frameCount;
         const kfWidget = this._widget("keyframes_data");
         if (kfWidget) kfWidget.value = JSON.stringify(kfObj);
-        // Remember which frame count these keyframes belong to (0 = none).
-        const nWidget = this._widget("keyframe_frame_count");
-        if (nWidget) {
-            nWidget.value = this.keyframes.size ? (this.kfFrameCount ?? this.frameCount) : 0;
-        }
         return saved;
     }
 
@@ -2102,8 +2120,7 @@ app.registerExtension({
                 if (w && (!w.value || w.value.length < 8)) {
                     w.value = uuid();
                 }
-                for (const name of ["keyframes_data", "brush_opacity", "brush_feather", "brush_size",
-                                    "keyframe_frame_count"]) {
+                for (const name of ["keyframes_data"]) {
                     const hw = self.widgets?.find(w => w.name === name);
                     if (!hw) continue;
                     hw.computeSize = () => [0, -4];
@@ -2120,6 +2137,36 @@ app.registerExtension({
                 () => openModal(self),
                 { serialize: false }
             );
+        };
+
+        // Workflows saved by earlier versions had extra widgets after
+        // keyframes_data: [.., keyframes_data, brush_size, brush_opacity,
+        // brush_feather(, keyframe_frame_count)]. Saved values are matched
+        // to widgets by position, so move those into their new homes.
+        const origConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            origConfigure?.apply(this, arguments);
+            const vals = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
+            if (!vals || vals.length < 8) return;
+            if (!this.properties) this.properties = {};
+            const names = ["brush_size", "brush_opacity", "brush_feather"];
+            names.forEach((n, k) => {
+                const v = vals[5 + k];
+                if (typeof v === "number" && isFinite(v) && this.properties[BRUSH_PROPS[n]] == null) {
+                    this.properties[BRUSH_PROPS[n]] = v;
+                }
+            });
+            const kfw = this.widgets?.find(w => w.name === "keyframes_data");
+            const n = vals[8];
+            if (kfw?.value && Number.isInteger(n) && n > 0 && readKeyframeFrameCount(kfw.value) == null) {
+                try {
+                    const obj = JSON.parse(kfw.value);
+                    if (obj && typeof obj === "object" && Object.keys(obj).some(k => /^\d+$/.test(k))) {
+                        obj._frame_count = n;
+                        kfw.value = JSON.stringify(obj);
+                    }
+                } catch (e) { __c2cReport("migrate", e); }
+            }
         };
     },
 });

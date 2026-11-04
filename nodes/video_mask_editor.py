@@ -2,11 +2,11 @@
 # by Code2Collapse (Likhith) -- https://github.com/Code2Collapse
 # (https://github.com/Code2Collapse/ComfyUI-CustomNodePacks), Apache-2.0.
 # Modified (see CHANGES.md for details): keyframes persisted in the workflow;
-# brush settings remembered; the node now serves its own downscaled reference
-# frames to the editor (no Preview Image node needed); it remembers the frame
-# count its keyframes were made for and refuses to run on an input whose size
-# or length no longer matches them; routes moved to /vme/*; menu category
-# changed.
+# brush settings kept by the editor rather than as inputs; the node now
+# serves its own downscaled reference frames to the editor (no Preview Image
+# node needed); it remembers the frame count its keyframes were made for and
+# refuses to run on an input whose size or length no longer matches them;
+# routes moved to /vme/*; menu category changed.
 """
 VideoMaskEditorMEC
 ==================
@@ -37,8 +37,8 @@ INPUTS (optional):
   input_mask     MASK    fallback mask (used for any frame that has no
                           pinned/tween value because the user hasn't
                           set any keyframes). Shape (B|1,H,W).
-  keyframes_data STRING  JSON {frame: base64 PNG}, written by the editor
-                          UI on Save. This is the durable copy of your
+  keyframes_data STRING  JSON {frame: base64 PNG, "_frame_count": N},
+                          written by the editor UI on Save. This is the durable copy of your
                           pinned keyframes: it travels with the saved
                           workflow, so edits survive a server restart or
                           opening the workflow elsewhere (the live
@@ -48,22 +48,17 @@ INPUTS (optional):
                           every Save, which is what lets IS_CHANGED
                           correctly invalidate the node's cache when
                           keyframes are edited.
-  brush_opacity  FLOAT   editor brush opacity, remembered across
-                          re-opens. Cosmetic only — excluded from
-                          IS_CHANGED.
-  brush_feather  FLOAT   editor brush edge softness, remembered across
-                          re-opens. Cosmetic only — excluded from
-                          IS_CHANGED. Default 0 (crisp brush).
-  brush_size     INT     editor brush radius (px), remembered across
-                          re-opens. Cosmetic only — excluded from
-                          IS_CHANGED.
-  keyframe_frame_count
-                 INT     frame count of the input the keyframes were made
-                          for (0 = unknown, e.g. keyframes saved by older
-                          versions). Written by the editor. Together with
-                          the keyframe PNGs' own width/height it lets the
-                          editor notice a changed input and offer to
-                          rescale the keyframes.
+                          "_frame_count" is the frame count of the input
+                          the keyframes were made for (absent = unknown,
+                          e.g. keyframes saved by older versions).
+                          Together with the keyframe PNGs' own width and
+                          height it lets the editor notice a changed
+                          input and offer to rescale the keyframes.
+
+  Editor-only settings (brush size/opacity/feather, preview size) live in
+  the node's properties, not in inputs: anything sent as an input becomes
+  part of ComfyUI's cache key, so changing it would re-run this node and
+  everything downstream even though the mask is the same.
 
 REFERENCE FRAMES:
   Each execute() remembers the input batch (a reference to the tensor, not
@@ -262,6 +257,18 @@ def _mask_to_png(arr: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def _keyframes_frame_count(raw: str) -> int:
+    """The "_frame_count" entry of keyframes_data (0 = absent/unknown)."""
+    if not raw:
+        return 0
+    try:
+        obj = json.loads(raw)
+        n = int(obj.get("_frame_count", 0)) if isinstance(obj, dict) else 0
+    except (TypeError, ValueError, AttributeError):
+        return 0
+    return max(0, n)
+
+
 def _decode_keyframes_field(raw: str) -> Dict[int, np.ndarray]:
     """Decode the keyframes_data widget's JSON payload — {frame: base64
     PNG} — into the same {frame_int: uint8 (H,W) mask} shape the live
@@ -279,6 +286,8 @@ def _decode_keyframes_field(raw: str) -> Dict[int, np.ndarray]:
     if not isinstance(obj, dict):
         return out
     for k, v in obj.items():
+        if not k.isdigit():  # e.g. "_frame_count"
+            continue
         try:
             frame = int(k)
             png_bytes = base64.b64decode(v)
@@ -639,7 +648,7 @@ def _check_keyframes_match(kfs: Dict[int, np.ndarray], n_frames: int,
     """Refuse to run when the keyframes were made for a different input.
 
     Width/height come from the keyframe masks themselves; the frame count
-    from the keyframe_frame_count widget (0 = unknown, not checked)."""
+    from keyframes_data's "_frame_count" (0 = unknown, not checked)."""
     if not kfs:
         return
     problems = []
@@ -714,27 +723,6 @@ class VideoMaskEditorMEC:
                         "by hand."
                     ),
                 }),
-                "brush_size": ("INT", {
-                    "default": 30, "min": 2, "max": 200, "step": 1,
-                    "tooltip": "Editor brush radius (px). Remembers your "
-                               "last value; has no effect on node output.",
-                }),
-                "brush_opacity": ("FLOAT", {
-                    "default": 1.0, "min": 0.05, "max": 1.0, "step": 0.01,
-                    "tooltip": "Editor brush opacity. Remembers your last "
-                               "value; has no effect on node output.",
-                }),
-                "brush_feather": ("FLOAT", {
-                    "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "tooltip": "Editor brush edge softness. Remembers your "
-                               "last value; has no effect on node output.",
-                }),
-                "keyframe_frame_count": ("INT", {
-                    "default": 0, "min": 0, "max": 1000000, "step": 1,
-                    "tooltip": "Internal: frame count of the input the "
-                               "keyframes were made for (0 = unknown). "
-                               "Written by the editor.",
-                }),
             },
         }
 
@@ -744,12 +732,10 @@ class VideoMaskEditorMEC:
 
     @classmethod
     def IS_CHANGED(cls, image, session_id, tween_mode, feather, threshold,
-                   input_mask=None, keyframes_data="", brush_opacity=1.0,
-                   brush_feather=0.0, brush_size=30, keyframe_frame_count=0,
-                   **kwargs):
+                   input_mask=None, keyframes_data="", **kwargs):
         return hash_args_and_kwargs(
             image, session_id, tween_mode, feather, threshold, input_mask,
-            keyframes_data, keyframe_frame_count, **kwargs,
+            keyframes_data,
         )
 
     def execute(
@@ -761,10 +747,7 @@ class VideoMaskEditorMEC:
         threshold: float,
         input_mask: Optional[torch.Tensor] = None,
         keyframes_data: str = "",
-        brush_opacity: float = 1.0,
-        brush_feather: float = 0.0,
-        brush_size: int = 30,
-        keyframe_frame_count: int = 0,
+        **_ignored,  # inputs removed in later versions (old API prompts)
     ):
         if image is None or not isinstance(image, torch.Tensor) or image.ndim != 4:
             raise ValueError("VideoMaskEditorMEC: image must be IMAGE tensor [B,H,W,C]")
@@ -778,7 +761,7 @@ class VideoMaskEditorMEC:
         with torch.inference_mode():
             return self._execute_impl(
                 image, session_id, tween_mode, feather, threshold, input_mask,
-                keyframes_data, keyframe_frame_count,
+                keyframes_data,
             )
 
     def _execute_impl(
@@ -790,7 +773,6 @@ class VideoMaskEditorMEC:
         threshold: float,
         input_mask: Optional[torch.Tensor] = None,
         keyframes_data: str = "",
-        keyframe_frame_count: int = 0,
     ):
         B, H, W, _C = image.shape
         sid = (session_id or "").strip()
@@ -822,7 +804,8 @@ class VideoMaskEditorMEC:
                 if kfs:
                     kf_source = "session"
 
-        _check_keyframes_match(kfs, B, H, W, int(keyframe_frame_count or 0))
+        kf_frame_count = _keyframes_frame_count(keyframes_data)
+        _check_keyframes_match(kfs, B, H, W, kf_frame_count)
 
         # Fallback mask: take first slice of input_mask, if any.
         fallback: Optional[np.ndarray] = None
@@ -857,7 +840,7 @@ class VideoMaskEditorMEC:
             "kf_source": kf_source,
             "frames": B,
             "shape": [H, W],
-            "keyframe_frame_count": int(keyframe_frame_count or 0),
+            "keyframe_frame_count": kf_frame_count,
             "tween_mode": tween_mode,
             "feather": float(feather),
             "threshold": float(threshold),
