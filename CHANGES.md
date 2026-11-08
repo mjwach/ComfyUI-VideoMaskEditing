@@ -56,10 +56,16 @@ and vendored third-party code.
   recorded when keyframes are first added, stored as a `_frame_count` entry
   inside `keyframes_data`. When the editor opens on an input whose
   width, height or frame count differs from the keyframes', a dialog offers
-  Cancel, Delete all keyframes, or Rescale (nearest-neighbor or bilinear;
-  frame indices scaled by new/old count and rounded). Keyframes are now
-  loaded at their own size instead of being stretched to the current
-  frames.
+  Cancel, Delete all keyframes, or applying a choice. A size change is
+  always resampled (nearest-neighbor or bilinear). For timing, keyframes
+  either keep their frames, optionally deleting any past the new end, or
+  are stretched (frame indices scaled by new/old count and rounded). Only
+  options that would change something are shown. Keyframes are now loaded
+  at their own size instead of being stretched to the current frames.
+- **Keyframes past the end** of the video are allowed. The sidebar marks
+  them "past end" (not clickable, but deletable), and the scrubber shows a
+  marker for them. Stretching timing keeps them past the end instead of
+  piling them onto the last frame.
 - **Mismatch check when running.** The node raises a clear error when its
   keyframes don't match the input's size, or a recorded frame count doesn't
   match the input's length.

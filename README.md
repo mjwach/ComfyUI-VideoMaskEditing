@@ -76,16 +76,33 @@ different width, height or frame count, a dialog compares the two and offers:
 - **Cancel**: close the editor and change nothing.
 - **Delete all keyframes**: start over. The remembered size is cleared too
   and gets recorded again with the next keyframe.
-- **Rescale keyframes**: resize every keyframe to the new width/height
-  (**nearest neighbor**, which keeps hard-edged masks hard, or **bilinear**)
-  and move it in time: its frame index is multiplied by
-  new frame count / old frame count and rounded to the nearest frame. If two
-  keyframes land on the same frame, the one whose exact position was
-  closest is kept.
+- **Apply** the choices shown above the buttons:
+  - **Size**: if the width or height changed, every keyframe is resized,
+    with **nearest neighbor** (keeps hard-edged masks hard) or **bilinear**.
+  - **Timing**: either **keep keyframes on their current frames**, or
+    **stretch timing** to the new length. Stretching multiplies each frame
+    index by new frame count / old frame count and rounds it. If two
+    keyframes land on the same frame, the one whose exact position was
+    closest is kept. If the old frame count isn't known (keyframes saved by
+    older versions), you type it in to stretch.
+  - When keeping keyframes in place would leave some **past the end** of the
+    video, a checkbox lets you delete them.
 
-If the keyframes' frame count isn't known (keyframes saved by older
-versions), the dialog asks you to enter it. The changes take effect when
-you **Save & Close**.
+  The button names what will actually happen ("Rescale keyframes", "Delete
+  those keyframes", or "Keep keyframes as they are"), and only the controls
+  that would make a difference are shown. Changes take effect when you
+  **Save & Close**.
+
+### Keyframes past the end of the video
+
+Keyframes may sit beyond the last frame, for example after keeping their
+positions when the video got shorter. They aren't shown on any frame, but
+the frames after the last visible keyframe blend toward them, as if they
+were just off-screen. (If every keyframe is past the end, every frame gets
+the earliest one.) In the editor they're listed in the sidebar as "past
+end", where ✕ deletes them, and a hollow marker at the right end of the
+scrubber shows they exist. Stretching timing keeps them proportionally past
+the end. If the video later gets longer, they come back into view.
 
 Until the keyframes are rescaled or deleted, running the node on a
 mismatched video stops with an error that says what doesn't match, instead
