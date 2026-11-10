@@ -57,10 +57,13 @@ and vendored third-party code.
   inside `keyframes_data`. When the editor opens on an input whose
   width, height or frame count differs from the keyframes', a dialog offers
   Cancel, Delete all keyframes, or applying a choice. A size change is
-  always resampled (nearest-neighbor or bilinear). For timing, keyframes
-  either keep their frames, optionally deleting any past the new end, or
-  are stretched (frame indices scaled by new/old count and rounded). Only
-  options that would change something are shown. Keyframes are now loaded
+  always resampled (nearest-neighbor or bilinear). For a length change the
+  user picks what happened to the video: trimmed/extended at the end
+  (keyframes keep their frames, optionally deleting any past the new end),
+  trimmed/extended at the start (keyframes shift by the length change; any
+  landing before frame 0 are deleted), or sped up/slowed down (frame
+  indices scaled by new/old count and rounded). Only options that would
+  change something are shown. Keyframes are now loaded
   at their own size instead of being stretched to the current frames.
 - **Keyframes past the end** of the video are allowed. The sidebar marks
   them "past end" (not clickable, but deletable), and the scrubber shows a

@@ -392,24 +392,32 @@ function _frameList(frames, max = 6) {
 /**
  * Shown when saved keyframes don't match the current input. Resolves to
  *   { action: "cancel" } | { action: "delete" } |
- *   { action: "apply", method, retime: bool, oldCount, crop: bool }
- * Width/height changes always resample. For time there is a choice:
- * keep keyframes on their frames (optionally deleting those past the new
- * end) or scale their positions to the new length.
+ *   { action: "apply", method, mode, oldCount, crop }
+ * Width/height changes are always resampled. For a length change the user
+ * says what happened to the video, which decides how keyframes move:
+ *   "keep"    trimmed/extended at the end   -> keyframes stay put
+ *             (crop: also delete those past the new end)
+ *   "shift"   trimmed/extended at the start -> keyframes move by the
+ *             length change; any that would land before frame 0 are deleted
+ *   "stretch" sped up / slowed down         -> positions scaled new/old
  */
 function showMismatchDialog(info) {
     // info: { inW, inH, inN, kfSizes: [[w,h],…], kfN (number|null), kfFrames: [int] }
     return new Promise((resolve) => {
-        const { backdrop, card } = _modalShell(540);
+        const { backdrop, card } = _modalShell(560);
         const nK = info.kfFrames.length;
+        const frames = [...info.kfFrames].sort((a, b) => a - b);
         const kfW = info.kfSizes.length === 1 ? info.kfSizes[0][0] : null;
         const kfH = info.kfSizes.length === 1 ? info.kfSizes[0][1] : null;
         const mixed = info.kfSizes.length > 1;
         const sizeDiffers = mixed || kfW !== info.inW || kfH !== info.inH;
-        const beyond = info.kfFrames.filter(f => f >= info.inN).sort((a, b) => a - b);
-        // Scaling time is only on offer when it could change something.
+        const beyond = frames.filter(f => f >= info.inN);
+        // Moving keyframes in time is only on offer when the length changed
+        // (or might have: unknown old count).
         const canRetime = info.kfN == null || info.kfN !== info.inN;
         const showTiming = canRetime || beyond.length > 0;
+        const plural = (n, one, many) => (n === 1 ? one : many);
+        const kfCount = (n) => `${n} keyframe${n === 1 ? "" : "s"}`;
 
         const h = document.createElement("div");
         h.textContent = "Keyframes don't match this input";
@@ -420,19 +428,20 @@ function showMismatchDialog(info) {
         if (sizeDiffers) what.push("a different frame size");
         if (info.kfN == null) what.push("an unknown number of frames");
         else if (info.kfN !== info.inN) what.push("a different number of frames");
-        intro.textContent =
-            `This node has ${nK} saved keyframe${nK === 1 ? "" : "s"}, made for a video with ` +
+        intro.textContent = `This node has ${kfCount(nK)}, made for a video with ` +
             what.join(" and ") + ". Choose what to do with them.";
 
-        // Comparison table.
+        // Comparison table. An unknown old frame count gets an input box,
+        // since shifting and stretching need it.
+        const ctlStyle = `padding:4px 6px;border-radius:5px;background:${C.bg};color:${C.text};border:1px solid ${C.border};font:inherit;`;
         const tbl = document.createElement("table");
         tbl.style.cssText = `border-collapse:collapse;width:100%;margin-bottom:14px;font-size:12px;`;
-        const cell = (txt, { head = false, bad = false } = {}) => {
+        const cell = (content, { head = false, bad = false } = {}) => {
             const td = document.createElement(head ? "th" : "td");
             td.style.cssText = `padding:6px 8px;border-bottom:1px solid ${C.border};text-align:${head ? "left" : "right"};` +
                 `font-weight:${head ? 600 : 400};color:${bad ? C.warn : (head ? C.sub : C.text)};` +
                 `font-family:${head ? "inherit" : "ui-monospace,monospace"};`;
-            td.textContent = txt;
+            if (content instanceof Node) td.appendChild(content); else td.textContent = content;
             return td;
         };
         const addRow = (label, made, now, bad) => {
@@ -445,7 +454,18 @@ function showMismatchDialog(info) {
         tbl.appendChild(hdr);
         addRow("Width", mixed ? "mixed" : String(kfW), String(info.inW), mixed || kfW !== info.inW);
         addRow("Height", mixed ? "mixed" : String(kfH), String(info.inH), mixed || kfH !== info.inH);
-        addRow("Frames", info.kfN == null ? "unknown" : String(info.kfN), String(info.inN), info.kfN !== info.inN);
+        let countInput = null;
+        if (info.kfN == null) {
+            countInput = document.createElement("input");
+            countInput.type = "number"; countInput.min = "1"; countInput.step = "1";
+            countInput.placeholder = "unknown";
+            countInput.title = "How many frames the video had when these keyframes were made. " +
+                               "Needed only to shift or stretch the keyframes.";
+            countInput.style.cssText = ctlStyle + `width:96px;text-align:right;border-color:${C.warn}88;`;
+            addRow("Frames", countInput, String(info.inN), true);
+        } else {
+            addRow("Frames", String(info.kfN), String(info.inN), info.kfN !== info.inN);
+        }
 
         const section = (title) => {
             const box = document.createElement("div");
@@ -456,7 +476,6 @@ function showMismatchDialog(info) {
             box.appendChild(t);
             return box;
         };
-        const ctlStyle = `padding:4px 6px;border-radius:5px;background:${C.bg};color:${C.text};border:1px solid ${C.border};font:inherit;`;
 
         // Size: always resampled when it differs; only the method is a choice.
         let sel = null;
@@ -476,50 +495,50 @@ function showMismatchDialog(info) {
             sizeBox.appendChild(row);
         }
 
-        // Timing.
-        let rKeep = null, rScale = null, countInput = null, cropBox = null;
-        const timingBox = section("Timing");
-        const optRow = (radio, content) => {
+        // Timing: one clickable card per explanation of the length change.
+        const timingBox = section(canRetime ? "Timing — how did the video's length change?" : "Timing");
+        let mode = canRetime ? (info.kfN == null ? "keep" : "stretch") : "keep";
+        const cards = {};
+        let cropBox = null;
+        const mkCrop = () => {
+            cropBox = document.createElement("input");
+            cropBox.type = "checkbox";
             const row = document.createElement("label");
-            row.style.cssText = "display:flex;align-items:center;gap:8px;margin:4px 0;cursor:pointer;flex-wrap:wrap;";
-            if (radio) row.appendChild(radio);
-            row.append(...content);
+            row.style.cssText = "display:flex;align-items:center;gap:8px;margin-top:6px;cursor:pointer;";
+            const t = document.createElement("span");
+            t.textContent = `Also delete the ${beyond.length === 1 ? "keyframe" : beyond.length + " keyframes"} ` +
+                `past the new end (${plural(beyond.length, "frame", "frames")} ${_frameList(beyond)}; ` +
+                `the last frame is now ${info.inN - 1})`;
+            row.append(cropBox, t);
             return row;
         };
-        const txt = (s) => { const e = document.createElement("span"); e.textContent = s; return e; };
-        if (showTiming) {
-            if (canRetime) {
-                rKeep = document.createElement("input");
-                rKeep.type = "radio"; rKeep.name = "vme-timing";
-                rScale = document.createElement("input");
-                rScale.type = "radio"; rScale.name = "vme-timing";
-                // Default: keep when the old length is unknown (most likely
-                // nothing changed), stretch when it's known to differ.
-                (info.kfN == null ? rKeep : rScale).checked = true;
-                timingBox.appendChild(optRow(rKeep, [txt("Keep keyframes on their current frames")]));
-            }
-            if (beyond.length) {
-                cropBox = document.createElement("input");
-                cropBox.type = "checkbox";
-                const row = optRow(cropBox, [txt(
-                    `Delete the ${beyond.length === 1 ? "keyframe" : beyond.length + " keyframes"} past the end ` +
-                    `(frame${beyond.length === 1 ? "" : "s"} ${_frameList(beyond)}; the last frame is now ${info.inN - 1})`)]);
-                if (canRetime) row.style.marginLeft = "24px";
-                timingBox.appendChild(row);
-            }
-            if (canRetime) {
-                const parts = [];
-                if (info.kfN == null) {
-                    countInput = document.createElement("input");
-                    countInput.type = "number"; countInput.min = "1"; countInput.step = "1";
-                    countInput.placeholder = "?";
-                    countInput.style.cssText = ctlStyle + "width:76px;text-align:right;";
-                    parts.push(txt("Stretch timing from"), countInput, txt(`frames to ${info.inN}`));
-                } else {
-                    parts.push(txt(`Stretch timing from ${info.kfN} frames to ${info.inN}`));
-                }
-                timingBox.appendChild(optRow(rScale, parts));
-            }
+        const mkCard = (key, title) => {
+            const el = document.createElement("label");
+            el.style.cssText = `display:flex;gap:10px;align-items:flex-start;padding:8px 10px;margin:6px 0;` +
+                `border-radius:7px;cursor:pointer;border:1px solid ${C.border};`;
+            const radio = document.createElement("input");
+            radio.type = "radio"; radio.name = "vme-timing"; radio.style.marginTop = "2px";
+            const body = document.createElement("div");
+            body.style.cssText = "flex:1;min-width:0;";
+            const t = document.createElement("div");
+            t.textContent = title;
+            t.style.cssText = `font-weight:600;color:${C.text};`;
+            const sub = document.createElement("div");
+            sub.style.cssText = `color:${C.sub};font-size:12px;line-height:1.45;margin-top:2px;`;
+            body.append(t, sub);
+            el.append(radio, body);
+            radio.addEventListener("change", () => { mode = key; onModeChosen(); });
+            cards[key] = { el, radio, body, sub };
+            timingBox.appendChild(el);
+            return cards[key];
+        };
+        if (canRetime) {
+            mkCard("keep", "Trimmed or extended at the end");
+            if (beyond.length) cards.keep.body.appendChild(mkCrop());
+            mkCard("shift", "Trimmed or extended at the start");
+            mkCard("stretch", "Sped up or slowed down (whole video resampled)");
+        } else if (beyond.length) {
+            timingBox.appendChild(mkCrop());
         }
 
         const explain = document.createElement("div");
@@ -538,26 +557,63 @@ function showMismatchDialog(info) {
         if (showTiming) card.appendChild(timingBox);
         card.append(explain, row);
 
-        const enteredCount = () => {
+        const oldCount = () => {
             if (!countInput) return info.kfN;
             const v = Number(countInput.value);
             return countInput.value !== "" && Number.isInteger(v) && v >= 1 ? v : null;
         };
         const state = () => {
-            const scaling = !!rScale?.checked;
-            const oldN = scaling ? enteredCount() : null;
-            const retime = scaling && oldN != null && oldN !== info.inN;
-            const crop = !scaling && !!cropBox?.checked;
-            return { scaling, oldN, retime, crop, valid: !scaling || oldN != null };
+            const oldN = oldCount();
+            const needsCount = mode === "shift" || mode === "stretch";
+            const d = oldN == null ? null : oldN - info.inN;      // > 0: video got shorter
+            return {
+                oldN, d,
+                valid: !needsCount || oldN != null,
+                stretch: mode === "stretch" && d != null && d !== 0,
+                shift: mode === "shift" && d != null && d !== 0,
+                crop: mode === "keep" && !!cropBox?.checked,
+            };
         };
+        const enterCountHint = "Enter the old frame count in the table above.";
         const update = () => {
             const s = state();
-            if (cropBox) {
-                cropBox.disabled = s.scaling;
-                cropBox.parentElement.style.opacity = s.scaling ? "0.45" : "1";
+            for (const [k, c] of Object.entries(cards)) {
+                const on = k === mode;
+                c.radio.checked = on;
+                c.el.style.background = on ? C.accent + "14" : "transparent";
+                c.el.style.borderColor = on ? C.accent + "88" : C.border;
             }
-            bApply.textContent = (sizeDiffers || s.retime) ? "Rescale keyframes"
-                : s.crop ? `Delete ${beyond.length === 1 ? "that keyframe" : "those keyframes"}`
+            if (cards.keep) cards.keep.sub.textContent = "Keyframes stay on their current frames.";
+            if (cards.shift) {
+                cards.shift.sub.textContent =
+                    s.d == null ? `Keyframes move by the number of frames removed or added. ${enterCountHint}`
+                    : s.d === 0 ? "That's the same length as now, so nothing moves."
+                    : s.d < 0 ? `Keyframes move ${-s.d} ${plural(-s.d, "frame", "frames")} later.`
+                    : `Keyframes move ${s.d} ${plural(s.d, "frame", "frames")} earlier.`;
+                if (s.d > 0) {
+                    const lost = frames.filter(f => f < s.d);
+                    if (lost.length) {
+                        cards.shift.sub.textContent += " " + (
+                            lost.length === nK
+                                ? `${nK === 1 ? "The only keyframe falls" : nK === 2 ? "Both keyframes fall" : `All ${nK} keyframes fall`} before the new start and will be deleted.`
+                                : lost.length === 1
+                                    ? `The keyframe on frame ${lost[0]} falls before the new start and will be deleted.`
+                                    : `The ${lost.length} keyframes on frames ${_frameList(lost)} fall before the new start and will be deleted.`);
+                    }
+                }
+            }
+            if (cards.stretch) {
+                cards.stretch.sub.textContent =
+                    s.d == null ? `Keyframe positions are scaled to the new length. ${enterCountHint}`
+                    : s.d === 0 ? "That's the same length as now, so nothing moves."
+                    : `Keyframe positions are multiplied by ${info.inN}/${s.oldN} and rounded ` +
+                      `(e.g. frame ${s.oldN - 1} → ${remapFrameIndex(s.oldN - 1, s.oldN, info.inN)}).`;
+            }
+
+            bApply.textContent =
+                s.shift ? (sizeDiffers ? "Resize and shift keyframes" : "Shift keyframes")
+                : (sizeDiffers || s.stretch) ? "Rescale keyframes"
+                : (s.crop && beyond.length) ? `Delete ${beyond.length === 1 ? "that keyframe" : "those keyframes"}`
                 : "Keep keyframes as they are";
             bApply.disabled = !s.valid;
             bApply.style.opacity = s.valid ? "1" : "0.5";
@@ -565,33 +621,35 @@ function showMismatchDialog(info) {
 
             const parts = [];
             if (sizeDiffers) parts.push(`Every keyframe will be resized to ${info.inW}×${info.inH}.`);
-            if (s.scaling && s.oldN == null) {
-                parts.push("Enter how many frames the keyframes were made for.");
-            } else if (s.retime) {
-                parts.push(`Keyframe positions will be multiplied by ${info.inN}/${s.oldN} and rounded to the nearest frame.`);
-            } else if (s.scaling) {
-                parts.push(`That's the same length as now, so keyframes stay on their frames.`);
-            } else if (canRetime) {
-                parts.push("Keyframes stay on their frames.");
-            }
-            if (beyond.length && !s.scaling) {
-                parts.push(s.crop
-                    ? `${beyond.length === 1 ? "The keyframe" : `The ${beyond.length} keyframes`} past the end will be deleted.`
-                    : `${beyond.length === 1 ? "The keyframe" : `The ${beyond.length} keyframes`} past the end will be kept: ` +
-                      `not shown, but the last frames still blend toward ${beyond.length === 1 ? "it" : "them"}.`);
+            if (!s.valid) parts.push(enterCountHint);
+            if (mode === "keep" && beyond.length && !s.crop) {
+                parts.push(`${beyond.length === 1 ? "The keyframe" : `The ${beyond.length} keyframes`} past the end ` +
+                    `will be kept: not shown, but the last frames still blend toward ${plural(beyond.length, "it", "them")}.`);
             }
             parts.push("Takes effect when you click Save & Close.");
             explain.textContent = parts.join(" ");
         };
-        for (const el of [rKeep, rScale, cropBox]) el?.addEventListener("change", update);
+        // Picking an option that needs the old frame count puts the cursor
+        // in that box, so it's one click + typing.
+        const onModeChosen = () => {
+            update();
+            if (countInput && countInput.value === "" && (mode === "shift" || mode === "stretch")) countInput.focus();
+        };
+        cropBox?.addEventListener("change", () => {
+            if (cropBox.checked && canRetime) mode = "keep";  // ticking it implies "at the end"
+            update();
+        });
         countInput?.addEventListener("input", update);
-        countInput?.addEventListener("focus", () => { if (rScale && !rScale.checked) { rScale.checked = true; update(); } });
         update();
 
         const onKey = (e) => {
             // Keep the editor's own shortcuts from firing behind the dialog.
+            // (This also keeps keydowns from reaching the dialog's own
+            // controls' listeners, so Enter in the count box is handled here.)
             e.stopImmediatePropagation();
-            if (e.type === "keydown" && e.key === "Escape") { e.preventDefault(); finish({ action: "cancel" }); }
+            if (e.type !== "keydown") return;
+            if (e.key === "Escape") { e.preventDefault(); finish({ action: "cancel" }); }
+            else if (e.key === "Enter" && e.target === countInput) { e.preventDefault(); bApply.click(); }
         };
         const finish = (res) => {
             document.removeEventListener("keydown", onKey, true);
@@ -604,7 +662,7 @@ function showMismatchDialog(info) {
         bApply.onclick = () => {
             const s = state();
             if (!s.valid) { countInput?.focus(); return; }
-            finish({ action: "apply", method: sel?.value || "nearest", retime: s.retime, oldCount: s.oldN, crop: s.crop });
+            finish({ action: "apply", method: sel?.value || "nearest", mode, oldCount: s.oldN, crop: s.crop });
         };
         document.addEventListener("keydown", onKey, true);
         document.addEventListener("keyup", onKey, true);
@@ -802,22 +860,33 @@ class VMEEditor {
         return true;
     }
 
-    /** Apply the mismatch dialog's choice: resize every keyframe to the
-     *  input's width/height; then either scale positions from oldCount
-     *  frames to the input's frame count (retime) or keep them, optionally
-     *  deleting those past the end (crop). Afterwards the keyframes belong
-     *  to the current input's frame count. Returns how many keyframes were
-     *  dropped because two landed on the same frame. */
-    _rescaleKeyframes({ method = "nearest", retime = false, oldCount = null, crop = false }) {
+    /** Apply the mismatch dialog's choice. Every keyframe is resized to
+     *  the input's width/height, then moved in time by `mode`:
+     *    "keep"    stays on its frame (crop: delete those past the new end)
+     *    "shift"   moves by the length change (oldCount - new count frames
+     *              earlier); any that would land before frame 0 are deleted
+     *    "stretch" position scaled from oldCount to the new frame count
+     *  Afterwards the keyframes belong to the current input's frame count.
+     *  Returns how many keyframes were dropped because two landed on the
+     *  same frame (stretch only). */
+    _rescaleKeyframes({ method = "nearest", mode = "keep", oldCount = null, crop = false }) {
         const newN = this.frameCount, W = this.frameW, H = this.frameH;
         const rgb = this._hexToRgb(C.accent);
+        const stretch = mode === "stretch" && oldCount != null && oldCount !== newN;
+        const shiftBy = mode === "shift" && oldCount != null ? oldCount - newN : 0;
         const out = new Map();
         const err = new Map();     // new index -> |exact - rounded|
         let dropped = 0;
         for (const [f, id] of [...this.keyframes.entries()].sort((a, b) => a[0] - b[0])) {
-            if (!retime && crop && f >= newN) continue;
-            const g = retime ? remapFrameIndex(f, oldCount, newN) : f;
-            const e = retime ? Math.abs(f * newN / oldCount - g) : 0;
+            if (mode === "keep" && crop && f >= newN) continue;
+            let g = f, e = 0;
+            if (stretch) {
+                g = remapFrameIndex(f, oldCount, newN);
+                e = Math.abs(f * newN / oldCount - g);
+            } else if (shiftBy) {
+                g = f - shiftBy;
+                if (g < 0) continue;            // trimmed away with the start
+            }
             if (out.has(g)) {
                 dropped++;
                 if (err.get(g) <= e) continue;
